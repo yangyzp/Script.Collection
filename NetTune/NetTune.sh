@@ -1,6 +1,7 @@
 #!/bin/bash
-# Linux 生产级智能优化脚本 v3.0.1 (BBR优化版)
-# 自动内存适配 | 5种业务场景 | BDP自动计算 | 自动去重 | 生产验证
+# Linux 生产级智能优化脚本 v3.0.2 (自动BBR版)
+# 自动内存适配 | 5种业务场景 | BDP自动计算 | 自动去重 | 自动BBR+fq
+# 专为代理网络/视频转发优化，内核支持则自动启用BBR+fq最佳组合
 
 # 颜色定义
 RED='\033[0;31m'
@@ -90,7 +91,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo -e "${BLUE}=======================================================${NC}"
-echo -e "${BLUE}  Linux 生产级智能优化脚本 v3.0.1 | BBR优化版${NC}"
+echo -e "${BLUE}  Linux 生产级智能优化脚本 v3.0.2 | 自动BBR+fq版${NC}"
 echo -e "${BLUE}=======================================================${NC}"
 echo ""
 
@@ -105,7 +106,7 @@ echo "1. 高并发Web/API/反向代理"
 echo "2. 通用业务服务器 (默认)"
 echo "3. 数据库/缓存/长连接服务"
 echo "4. 批处理/大数据任务"
-echo "5. 代理网络/流量转发/视频代理 ✅ 推荐BBR"
+echo "5. 代理网络/流量转发/视频代理 ✅ 推荐"
 read -p "请输入选项(1-5，默认2): " SCENARIO
 SCENARIO=${SCENARIO:-2}
 
@@ -244,41 +245,24 @@ else
 fi
 echo ""
 
-echo -e "${YELLOW}6. BBR拥塞控制${NC}"
+echo -e "${YELLOW}6. 自动配置BBR+fq拥塞控制...${NC}"
 KERNEL_VERSION=$(uname -r | cut -d'-' -f1)
 BBR_CONFIG=""
 if ! kernel_lt "$KERNEL_VERSION" "4.9"; then
-    echo -e "${YELLOW}⚠️ BBR注意事项（完整保留）：${NC}"
-    echo -e "  ✅ 优点：在长距离、高延迟、大带宽网络下，速度比默认Cubic提升30%-200%"
-    echo -e "  ❌ 缺点：在共享带宽的VPS上可能抢占过多带宽，影响其他服务"
-    echo -e "  ❌ 缺点：在局域网（延迟<10ms）环境下优势不明显"
-    echo -e "  ❌ 缺点：在带宽波动极大的网络下稳定性略低于Cubic"
-    
-    # 代理场景特别提示
-    if [[ $SCENARIO -eq 5 ]]; then
-        echo -e ""
-        echo -e "${GREEN}💡 代理网络强烈推荐：${NC}"
-        echo -e "  BBR+fq是目前代理和视频转发的最佳组合，能显著降低卡顿和缓冲"
-    fi
-    
-    read -p "是否启用BBR+fq？(y/n，默认y): " ENABLE_BBR
-    if [[ "$ENABLE_BBR" != "n" ]]; then
-        modprobe tcp_bbr 2>/dev/null
-        modprobe sch_fq 2>/dev/null
-        if lsmod | grep -q bbr && lsmod | grep -q fq; then
-            BBR_CONFIG="# BBR 拥塞控制算法 + fq 队列管理
+    # 自动加载BBR和fq模块
+    modprobe tcp_bbr 2>/dev/null
+    modprobe sch_fq 2>/dev/null
+    if lsmod | grep -q bbr && lsmod | grep -q fq; then
+        BBR_CONFIG="# BBR 拥塞控制算法 + fq 队列管理（自动启用）
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr"
-            BBR_ENABLED=1
-            echo -e "${GREEN}✓ BBR+fq已成功启用${NC}"
-        else
-            echo -e "${RED}✗ BBR或fq模块加载失败${NC}"
-        fi
+        BBR_ENABLED=1
+        echo -e "${GREEN}✓ 内核支持，自动启用BBR+fq最佳组合${NC}"
     else
-        echo -e "${YELLOW}✓ 跳过BBR配置${NC}"
+        echo -e "${YELLOW}⚠ BBR或fq模块加载失败，将使用默认拥塞控制${NC}"
     fi
 else
-    echo -e "${YELLOW}⚠ 内核过低，不支持BBR${NC}"
+    echo -e "${YELLOW}⚠ 内核版本低于4.9，不支持BBR${NC}"
 fi
 echo ""
 
@@ -363,13 +347,13 @@ echo -e "${YELLOW}🔍 验证命令${NC}"
 echo -e "  ulimit -n                          # 应显示：$SYSTEM_MAX_FILE"
 echo -e "  sysctl fs.file-max                 # 应显示：$EXPECTED_FS_FILE_MAX"
 echo -e "  sysctl net.core.somaxconn          # 应显示：$EXPECTED_SOMAXCONN"
-echo -e "  sysctl net.core.default_qdisc      # 应显示：fq"
 echo -e "  sysctl net.ipv4.tcp_retries2       # 应显示：$EXPECTED_TCP_RETRIES2"
 if [ $AUTO_CALC_DONE -eq 1 ]; then
 echo -e "  sysctl net.ipv4.tcp_rmem          # 应显示：$TCP_RMEM_EXPECTED"
 echo -e "  sysctl net.ipv4.tcp_wmem          # 应显示：$TCP_WMEM_EXPECTED"
 fi
 if [ $BBR_ENABLED -eq 1 ]; then
+echo -e "  sysctl net.core.default_qdisc      # 应显示：fq"
 echo -e "  sysctl net.ipv4.tcp_congestion_control  # 应显示：bbr"
 fi
 echo ""
@@ -394,7 +378,7 @@ if [[ $SCENARIO -eq 5 ]]; then
     echo -e "  ✅ 优化网络中断处理时间，降低延迟"
     echo -e "  ✅ 禁用NAT环境下有问题的参数"
     if [ $BBR_ENABLED -eq 1 ]; then
-    echo -e "  ✅ 启用BBR+fq最佳组合，视频流畅度显著提升"
+    echo -e "  ✅ 自动启用BBR+fq最佳组合，视频流畅度显著提升"
     fi
     echo ""
 fi
