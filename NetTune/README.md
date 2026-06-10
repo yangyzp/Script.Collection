@@ -1,6 +1,8 @@
 # 内核参数和应用层参数 优化脚本
 
-
+```
+wget -N --no-check-certificate "https://raw.githubusercontent.com/yangyzp/Script.Collection/master/NetTune/NetTune.sh" && chmod +x NetTune.sh && ./NetTune.sh || yum install wget -y && wget -N --no-check-certificate "https://raw.githubusercontent.com/yangyzp/Script.Collection/master/NetTune/NetTune.sh" && chmod +x NetTune.sh && ./NetTune.sh
+```
 
 这是一款**经过多轮专业评审、100% 生产就绪**的 Linux 系统优化脚本，从最初的入门级模板迭代而来，逐一修复了网上通用优化脚本的 90% 以上常见坑，无需用户精通内核参数，只需简单几步即可获得适配自身业务和硬件的最优配置。
 
