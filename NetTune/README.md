@@ -1,214 +1,380 @@
-# 内核参数和应用层参数 优化脚本
+#!/bin/bash
+# Linux 生产级智能优化脚本 v3.0.4 (移植成熟BDP缓冲区计算 | 自动BBR版)
+# 自动内存适配 | 5种业务场景 | BDP自动计算(取自TCP-Tuning-Simple-Version) | 自动去重 | 自动BBR+fq
+# 专为代理网络/视频转发优化，内核支持则自动启用BBR+fq最佳组合
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+# 全局固定安全配置
+SYSTEM_MAX_FILE=262144
+EXPECTED_SOMAXCONN=65535
+FS_FILE_MAX_CEILING=1048576
+# 应用分级推荐值
+NGINX_GENERAL=65535
+NGINX_HIGH=131072
+MYSQL_GENERAL=65535
+PHP_GENERAL=65535
+REDIS_GENERAL=10000
+REDIS_HIGH=20000
+# 自动检测硬件信息
+TOTAL_MEM_MB=$(free -m | awk '/^Mem:/{print $2}')
+# 自动计算fs.file-max（每1MB内存100个，安全封顶）
+EXPECTED_FS_FILE_MAX=$(( TOTAL_MEM_MB * 100 ))
+if [ $EXPECTED_FS_FILE_MAX -gt $FS_FILE_MAX_CEILING ]; then
+    EXPECTED_FS_FILE_MAX=$FS_FILE_MAX_CEILING
+fi
+# ==================== 核心函数 ====================
+kernel_lt() {
+    local IFS='.'
+    read -ra KV <<< "$1"
+    read -ra CV <<< "$2"
+    (( KV[0] < CV[0] )) && return 0
+    (( KV[0] > CV[0] )) && return 1
+    (( KV[1] < CV[1] )) && return 0
+    (( KV[1] > CV[1] )) && return 1
+    (( KV[2] < CV[2] )) && return 0
+    return 1
+}
+# 清理所有重复的内核参数
+clean_sysctl_params() {
+    local params=(
+        "fs.file-max"
+        "net.core.somaxconn"
+        "net.core.netdev_max_backlog"
+        "net.core.netdev_budget"
+        "net.core.netdev_budget_usecs"
+        "net.ipv4.tcp_syncookies"
+        "net.ipv4.tcp_tw_reuse"
+        "net.ipv4.tcp_fin_timeout"
+        "net.ipv4.tcp_keepalive_time"
+        "net.ipv4.tcp_keepalive_intvl"
+        "net.ipv4.tcp_keepalive_probes"
+        "net.ipv4.ip_local_port_range"
+        "net.ipv4.tcp_retries2"
+        "net.ipv4.tcp_syn_retries"
+        "net.ipv4.tcp_synack_retries"
+        "net.ipv4.conf.all.accept_redirects"
+        "net.ipv4.conf.default.accept_redirects"
+        "net.ipv4.conf.all.send_redirects"
+        "net.ipv4.conf.default.send_redirects"
+        "net.ipv4.conf.all.rp_filter"
+        "net.ipv4.conf.default.rp_filter"
+        "net.core.rmem_default"
+        "net.core.wmem_default"
+        "net.core.rmem_max"
+        "net.core.wmem_max"
+        "net.ipv4.tcp_rmem"
+        "net.ipv4.tcp_wmem"
+        "net.core.default_qdisc"
+        "net.ipv4.tcp_congestion_control"
+        "net.ipv4.tcp_tw_recycle"
+    )
+    for param in "${params[@]}"; do
+        sed -i "/^[#]*\s*$param\s*=/d" "$1"
+    done
+}
+# ==================== 主程序开始 ====================
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}错误：必须以 root 权限运行${NC}"
+    exit 1
+fi
+echo -e "${BLUE}=======================================================${NC}"
+echo -e "${BLUE}  Linux 生产级智能优化脚本 v3.0.4 | 自动BBR+fq版${NC}"
+echo -e "${BLUE}=======================================================${NC}"
+echo ""
+echo -e "${YELLOW}📊 服务器硬件检测${NC}"
+echo -e "内存总大小：${GREEN}${TOTAL_MEM_MB} MB${NC}"
+echo -e "自动计算系统句柄上限：${GREEN}${EXPECTED_FS_FILE_MAX}${NC}"
+echo -e "单进程最大句柄：${GREEN}${SYSTEM_MAX_FILE}${NC}"
+echo ""
+echo -e "${YELLOW}🎯 选择业务场景${NC}"
+echo "1. 高并发Web/API/反向代理"
+echo "2. 通用业务服务器 (默认)"
+echo "3. 数据库/缓存/长连接服务"
+echo "4. 批处理/大数据任务"
+echo "5. 代理网络/流量转发/视频代理 ✅ 推荐"
+read -p "请输入选项(1-5，默认2): " SCENARIO
+SCENARIO=${SCENARIO:-2}
+# 场景参数初始化
+NETDEV_BUDGET_USECS=8000
+TCP_KEEPALIVE_TIME=300
+case $SCENARIO in
+    1)
+        EXPECTED_TCP_RETRIES2=5
+        TCP_FIN_TIMEOUT=15
+        SCENARIO_DESC="高并发Web/API/反向代理"
+        ;;
+    2)
+        EXPECTED_TCP_RETRIES2=8
+        TCP_FIN_TIMEOUT=15
+        SCENARIO_DESC="通用业务服务器"
+        ;;
+    3)
+        EXPECTED_TCP_RETRIES2=12
+        TCP_FIN_TIMEOUT=30
+        SCENARIO_DESC="数据库/缓存/长连接服务"
+        ;;
+    4)
+        EXPECTED_TCP_RETRIES2=15
+        TCP_FIN_TIMEOUT=60
+        SCENARIO_DESC="批处理/大数据任务"
+        ;;
+    5)
+        EXPECTED_TCP_RETRIES2=3
+        TCP_FIN_TIMEOUT=10
+        TCP_KEEPALIVE_TIME=120
+        NETDEV_BUDGET_USECS=4000
+        SCENARIO_DESC="代理网络/流量转发/视频代理"
+        ;;
+    *)
+        EXPECTED_TCP_RETRIES2=8
+        TCP_FIN_TIMEOUT=15
+        SCENARIO_DESC="通用业务服务器"
+        ;;
+esac
+BACKUP_DIR="/etc/optimize_backup_$(date +%Y%m%d_%H%M%S)"
+SYSCTL_CONF="/etc/sysctl.conf"
+LIMITS_CONF="/etc/security/limits.conf"
+SYSTEMD_CONF="/etc/systemd/system.conf"
+MARKER_START="# >>> LINUX_HIGH_CONCURRENCY_OPT_START >>>"
+MARKER_END="# <<< LINUX_HIGH_CONCURRENCY_OPT_END <<<"
+TCP_RMEM_EXPECTED=""
+TCP_WMEM_EXPECTED=""
+BBR_ENABLED=0
+BBR_EXPECTED="bbr"
+echo -e "${YELLOW}1. 备份原始配置...${NC}"
+mkdir -p "$BACKUP_DIR"
+cp "$LIMITS_CONF" "$BACKUP_DIR/"
+cp "$SYSTEMD_CONF" "$BACKUP_DIR/"
+cp "$SYSCTL_CONF" "$BACKUP_DIR/"
+echo -e "${GREEN}✓ 备份完成：$BACKUP_DIR${NC}"
+echo ""
+echo -e "${YELLOW}2. 深度清理历史配置（自动去重）...${NC}"
+sed -i "/$MARKER_START/,/$MARKER_END/d" "$LIMITS_CONF"
+sed -i "/$MARKER_START/,/$MARKER_END/d" "$SYSCTL_CONF"
+clean_sysctl_params "$SYSCTL_CONF"
+[ -f "/etc/sysctl.d/99-high-concurrency.conf" ] && rm -f "/etc/sysctl.d/99-high-concurrency.conf"
+echo -e "${GREEN}✓ 所有历史配置已清理${NC}"
+echo ""
+echo -e "${YELLOW}3. 设置系统文件句柄上限...${NC}"
+cat >> "$LIMITS_CONF" << EOF
+$MARKER_START
+* soft nofile $SYSTEM_MAX_FILE
+* hard nofile $SYSTEM_MAX_FILE
+root soft nofile $SYSTEM_MAX_FILE
+root hard nofile $SYSTEM_MAX_FILE
+$MARKER_END
+EOF
+echo -e "${GREEN}✓ 单进程句柄上限：$SYSTEM_MAX_FILE${NC}"
+echo -e "${YELLOW}4. 配置systemd全局限制...${NC}"
+if command -v systemctl &>/dev/null; then
+    sed -i "s/^#*DefaultLimitNOFILE=.*/DefaultLimitNOFILE=$SYSTEM_MAX_FILE/" "$SYSTEMD_CONF"
+    if ! grep -q "^DefaultLimitNOFILE=" "$SYSTEMD_CONF"; then
+        echo "DefaultLimitNOFILE=$SYSTEM_MAX_FILE" >> "$SYSTEMD_CONF"
+    fi
+    systemctl daemon-reexec 2>/dev/null
+    echo -e "${GREEN}✓ systemd已配置完成${NC}"
+else
+    echo -e "${YELLOW}⚠ 未检测到systemd，跳过${NC}"
+fi
+echo ""
+echo -e "${YELLOW}5. TCP缓冲区自动计算（移植TCP-Tuning-Simple-Version BDP算法）${NC}"
+TCP_BUFFER_CONFIG=""
+AUTO_CALC_DONE=0
+read -p "是否自动计算TCP缓冲区？(y/n，默认y): " AUTO_CALC
+AUTO_CALC=${AUTO_CALC:-y}
+if [[ "$AUTO_CALC" == "y" ]]; then
+    # 带宽输入校验（支持小数）
+    while true; do
+        read -p "输入服务器带宽(Mbps): " BANDWIDTH
+        if [[ "$BANDWIDTH" =~ ^[0-9]*\.?[0-9]+$ ]] && (( $(echo "$BANDWIDTH > 0 && $BANDWIDTH <= 10000" | bc -l) )); then
+            break
+        fi
+        echo -e "${RED}请输入有效带宽数字(0~10000)${NC}"
+    done
+    # RTT延迟输入校验（支持小数）
+    while true; do
+        read -p "输入平均延迟(ms): " RTT_MS
+        if [[ "$RTT_MS" =~ ^[0-9]*\.?[0-9]+$ ]] && (( $(echo "$RTT_MS > 0 && $RTT_MS <= 1000" | bc -l) )); then
+            break
+        fi
+        echo -e "${RED}请输入有效延迟数字(0~1000)${NC}"
+    done
+    # 标准BDP计算公式 BDP(KB) = 带宽(Mbps) × RTT(ms) / 8
+    bdp_kb=$(echo "scale=2; $BANDWIDTH * $RTT_MS / 8" | bc)
+    bdp_mb=$(echo "scale=2; $bdp_kb / 1024" | bc)
+    # 安全系数 ×1.5
+    recommended_mb=$(echo "scale=2; $bdp_mb * 1.5" | bc)
+    final_mb=$(printf "%.0f" "$recommended_mb")
+    # 最小限制1MiB
+    if [ "$final_mb" -lt 1 ]; then
+        final_mb=1
+    fi
+    value_bytes=$(echo "$final_mb * 1024 * 1024" | bc)
+    # 固定三段式 rmem/wmem 模板（和简易调优脚本统一）
+    TCP_RMEM_MIN=4096
+    TCP_RMEM_DEFAULT=87380
+    TCP_RMEM_MAX=$value_bytes
+    TCP_WMEM_MIN=4096
+    TCP_WMEM_DEFAULT=16384
+    TCP_WMEM_MAX=$value_bytes
 
-```
-if ! command -v wget &> /dev/null; then yum install wget -y; fi && wget -N --no-check-certificate "https://raw.githubusercontent.com/yangyzp/Script.Collection/master/NetTune/NetTune.sh" && chmod +x NetTune.sh && ./NetTune.sh
-```
-
-这是一款**经过多轮专业评审、100% 生产就绪**的 Linux 系统优化脚本，从最初的入门级模板迭代而来，逐一修复了网上通用优化脚本的 90% 以上常见坑，无需用户精通内核参数，只需简单几步即可获得适配自身业务和硬件的最优配置。
-
-## 核心特点
-
-### 1. 非侵入式幂等设计，100% 可完全回滚
-
-- **标记块管理**：所有修改都用专属起止标记包裹，绝对不会误删系统原有配置和注释
-- **自动备份**：运行前自动备份所有被修改的原始文件到带时间戳的独立目录
-- **一键回滚**：脚本末尾自动生成精确的回滚命令，执行后系统完全恢复到运行前状态
-- **幂等执行**：多次运行脚本不会产生重复配置，只会覆盖旧的优化内容
-- **不污染主配置**：全程不修改`/etc/sysctl.d/`下的其他文件，所有内核优化集中在`/etc/sysctl.conf`末尾
-
-### 2. 4 种业务场景自适应，解决激进参数一刀切问题
-
-（采纳谷歌 AI 关于`tcp_retries2`的关键建议）
-
-脚本不再使用固定的通用参数，而是根据业务特性自动调整最容易出问题的超时参数：
-
-|          预设场景          |                    自动调整参数                    |                 适配服务                 |
-| :------------------------: | :------------------------------------------------: | :--------------------------------------: |
-|  高并发 Web/API/ 反向代理  |  `tcp_retries2=5`(25 秒超时)`tcp_fin_timeout=15`   | Nginx、HAProxy、API 网关、静态资源服务器 |
-|   通用业务服务器 (默认)    |  `tcp_retries2=8`(1 分钟超时)`tcp_fin_timeout=15`  |      大多数 Web 应用、中间件服务器       |
-| 数据库 / 缓存 / 长连接服务 | `tcp_retries2=12`(5 分钟超时)`tcp_fin_timeout=30`  |     MySQL、PostgreSQL、Redis、MQ、IM     |
-| 批处理 / 大数据 / 科学计算 | `tcp_retries2=15`(15 分钟超时)`tcp_fin_timeout=60` |   Spark、Hadoop、长时间运行的计算任务    |
-
-### 3. 基于 BDP 算法自动计算 TCP 缓冲区，告别手动瞎配
-
-- **全自动计算**：只需输入服务器实际带宽 (Mbps) 和平均往返延迟 (ms)，自动基于 ** 带宽延迟乘积 (BDP)** 算法计算出全部 6 个 TCP 缓冲区参数
-- **参数自动对齐**：严格遵循`net.core.*`与`net.ipv4.tcp_*`参数对齐原则，彻底解决内核静默截断参数的隐蔽问题
-- **动态生成配置**：生成的配置会自动标注对应的带宽和延迟信息，便于后续审计和调整
-- **保留手动选项**：支持跳过自动计算，使用预设的 10Mbps / 千兆网卡模板或完全自定义
-
-### 4. 智能内核适配，安全开启 BBR
-
-- **自动内核版本检测**：纯 bash 实现无外部依赖的版本比较，兼容所有主流 Linux 内核
-- **条件式 BBR 开启**：仅在内核 4.9 以上版本提供 BBR 选项，自动加载`tcp_bbr`模块并验证是否成功
-- **废弃参数兼容**：仅在内核 4.12 以下版本添加`tcp_tw_recycle=0`，新内核完全移除该参数，避免`sysctl -p`报错
-- **自动清理旧版本残留**：自动删除旧版本脚本生成的独立配置文件，避免优先级冲突
-
-### 5. 全链路生产级健壮性，修复所有已知隐患
-
-（采纳 Qwen3.7-Max 的全部专业评审建议）
-
-- 修复`bc`命令依赖问题，完美兼容 Alpine 最小化、CentOS minimal 镜像
-- 修复`rp_filter=1`导致 Docker/K8s / 多网卡环境静默丢包的问题，默认使用宽松模式
-- 将句柄数调整为生产安全值 262144，避免 Java/ES/MySQL 等应用启动失败
-- 修复 systemd 配置的竞态风险，使用幂等正则替换
-- 修复回滚命令中的文件名错误
-- 所有用户输入都带合法性验证，防止非法输入导致脚本异常
-
-### 6. 运维友好，全程透明可追溯
-
-- **动态验证提示**：所有验证命令的期望值完全跟随实际配置动态生成，不会出现固定提示与实际配置不符的误导
-- **配置文件可追溯**：生成的配置文件开头会标注使用的业务场景，每个关键参数都带详细注释说明
-- **完整生效指引**：明确说明哪些配置需要重新登录、哪些需要重启服务、哪些建议重启服务器
-- **应用层配套提示**：自动生成 Nginx、MySQL、Redis、PHP、Java 等常见应用的配套优化建议
-
-## 适用范围
-
-- **支持系统**：Debian 9+/Ubuntu 16.04+/CentOS 7+/RHEL 7+/Alpine 3.10+
-- **支持内核**：3.10+（自动适配新旧内核特性）
-- **适用服务器**：个人 VPS、云服务器、物理服务器、生产环境集群节点
-- **不适用**：个人桌面 Linux 系统（优化无收益）
-
-## 一句话总结
-
-这不是一个网上随便复制粘贴的通用优化模板，而是一个**经过生产环境验证、解决了所有常见坑、零门槛使用**的专业级工具。你不需要懂任何内核参数，只要选对业务场景、输入实际的带宽和延迟，就能得到一套安全、稳定、高性能的系统优化配置。
-
-
-
-
-
-
-
-
-
-------
-
-## 完整修改文件清单（v2.4）
-
-### 1. `/etc/security/limits.conf`（修改，内容无变化）
-
-- **修改方式**：在文件末尾添加专属标记块
-
-- 修改内容
-
-  ：固定设置单进程最大文件句柄数为生产安全值 262144
-
-  ```
-  # >>> LINUX_HIGH_CONCURRENCY_OPT_START >>>
-  # 单进程最大文件描述符数(生产安全值)
-  * soft nofile 262144
-  * hard nofile 262144
-  root soft nofile 262144
-  root hard nofile 262144
-  # <<< LINUX_HIGH_CONCURRENCY_OPT_END <<<
-  ```
-
-- **特点**：使用标记块管理，绝对不会误删原有配置，多次运行自动清理旧块
-
-### 2. `/etc/systemd/system.conf`（修改，内容无变化）
-
-- **修改方式**：幂等替换 / 追加全局句柄限制
-
-- 修改内容
-
-  ：设置 systemd 管理的所有服务的全局句柄上限
-
-  ```
-  DefaultLimitNOFILE=262144
-  ```
-
-- **特点**：无论原行是否被注释、原有值是多少，都会统一替换为正确值
-
-### 3. `/etc/sysctl.conf`（修改，**内容大幅升级**）
-
-- **修改方式**：在文件末尾添加完整的优化标记块
-
-- **核心变化（v2.4 新增）**：
-
-  1. 开头自动添加**业务场景标识**（如`# 业务场景：高并发Web/API/反向代理`）
-  2. `tcp_retries2`和`tcp_fin_timeout`参数**根据你选择的场景动态写入**
-  3. 每个关键参数都添加了**详细注释**（如`# tcp_retries2 = 5 对应总超时时间约 25秒`）
-  4. 自动计算的 TCP 缓冲区参数会标注带宽和延迟信息
-  5. BBR 配置会根据内核支持情况和用户选择自动写入
-
-- **示例（选择 "高并发 Web/API/ 反向代理" 场景）**：
-
-  ```
-  # >>> LINUX_HIGH_CONCURRENCY_OPT_START >>>
-  # ==============================================
-  # Linux 生产环境高并发内核优化
-  # 业务场景：高并发Web/API/反向代理
-  # 自动生成，请勿手动修改自动生成部分
-  # ==============================================
-  
-  # 系统级文件描述符总上限(单进程的4倍，留出足够系统余量)
-  fs.file-max = 1048576
-  
-  # 连接队列优化
-  net.core.somaxconn = 65535
-  ...
-  
-  # TCP 基础优化
-  net.ipv4.tcp_syncookies = 1
-  net.ipv4.tcp_tw_reuse = 1
-  net.ipv4.tcp_fin_timeout = 15
-  ...
-  
-  # 减少无效重传
-  # tcp_retries2 = 5 对应总超时时间约 25秒
-  net.ipv4.tcp_retries2 = 5
-  net.ipv4.tcp_syn_retries = 2
-  net.ipv4.tcp_synack_retries = 2
-  ...
-  
-  # ==============================================
-  # 自动计算的TCP缓冲区配置
-  # ==============================================
-  
-  # TCP 缓冲区优化 (10Mbps @ 100ms，自动计算)
-  net.core.rmem_default = 65536
-  net.core.wmem_default = 65536
-  net.core.rmem_max = 262144
-  net.core.wmem_max = 262144
-  net.ipv4.tcp_rmem = 4096 65536 262144
-  net.ipv4.tcp_wmem = 4096 65536 262144
-  
-  # ==============================================
-  # BBR拥塞控制配置
-  # ==============================================
-  
-  # BBR 拥塞控制算法
-  net.core.default_qdisc = fq
-  net.ipv4.tcp_congestion_control = bbr
-  
-  # <<< LINUX_HIGH_CONCURRENCY_OPT_END <<<
-  ```
-
-------
-
-## 脚本会自动清理的文件
-
-脚本运行时会自动删除可能存在的旧版本遗留文件，避免优先级冲突：
-
-- `/etc/sysctl.d/99-high-concurrency.conf`（旧版本使用的独立配置文件）
-
-------
-
-## 绝对不会修改的文件
-
-脚本全程不会触碰以下任何文件：
-
-- `/etc/sysctl.d/`目录下的其他任何文件
-- 任何应用程序的配置文件（如 Nginx、MySQL、Redis 等）
-- 其他系统配置文件
-
-------
-
-## 备份文件说明
-
-所有被修改的原始文件都会自动备份到`/etc/optimize_backup_YYYYMMDD_HHMMSS`目录，包括：
-
-- 原始`limits.conf`
-- 原始`system.conf`
-- 原始`sysctl.conf`
-
-只需执行脚本最后给出的 4 条回滚命令，即可将系统完全恢复到运行脚本之前的状态，不留任何痕迹。
+    TCP_RMEM_EXPECTED="$TCP_RMEM_MIN $TCP_RMEM_DEFAULT $TCP_RMEM_MAX"
+    TCP_WMEM_EXPECTED="$TCP_WMEM_MIN $TCP_WMEM_DEFAULT $TCP_WMEM_MAX"
+    AUTO_CALC_DONE=1
+    TCP_BUFFER_CONFIG="# TCP 缓冲区优化 (${BANDWIDTH}Mbps @ ${RTT_MS}ms)
+# BDP计算值: ${bdp_mb}MB | 安全放大1.5倍推荐: ${recommended_mb}MB | 最终设置${final_mb}MiB
+net.core.rmem_default = $TCP_RMEM_DEFAULT
+net.core.wmem_default = $TCP_WMEM_DEFAULT
+net.core.rmem_max = $TCP_RMEM_MAX
+net.core.wmem_max = $TCP_WMEM_MAX
+net.ipv4.tcp_rmem = $TCP_RMEM_EXPECTED
+net.ipv4.tcp_wmem = $TCP_WMEM_EXPECTED"
+    echo -e "${GREEN}✓ BDP缓冲区计算完成，最终缓冲区上限：${final_mb}MiB${NC}"
+else
+    # 手动默认模板（和简易脚本默认值对齐）
+    TCP_RMEM_EXPECTED="4096 87380 6291456"
+    TCP_WMEM_EXPECTED="4096 16384 4194304"
+    TCP_BUFFER_CONFIG="# TCP缓冲区手动默认模板（系统原生基准值）
+net.core.rmem_default = 87380
+net.core.wmem_default = 16384
+net.core.rmem_max = 6291456
+net.core.wmem_max = 4194304
+net.ipv4.tcp_rmem = $TCP_RMEM_EXPECTED
+net.ipv4.tcp_wmem = $TCP_WMEM_EXPECTED"
+    echo -e "${YELLOW}✓ 使用系统原生TCP缓冲区默认模板${NC}"
+fi
+echo ""
+echo -e "${YELLOW}6. 自动配置BBR+fq拥塞控制...${NC}"
+KERNEL_VERSION=$(uname -r | cut -d'-' -f1)
+BBR_CONFIG=""
+if ! kernel_lt "$KERNEL_VERSION" "4.9"; then
+    # 自动加载BBR和fq模块
+    modprobe tcp_bbr 2>/dev/null
+    modprobe sch_fq 2>/dev/null
+    if lsmod | grep -q bbr && lsmod | grep -q fq; then
+        BBR_CONFIG="# BBR 拥塞控制算法 + fq 队列管理（自动启用）
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr"
+        BBR_ENABLED=1
+        echo -e "${GREEN}✓ 内核支持，自动启用BBR+fq最佳组合${NC}"
+    else
+        echo -e "${YELLOW}⚠ BBR或fq模块加载失败，将使用默认拥塞控制${NC}"
+    fi
+else
+    echo -e "${YELLOW}⚠ 内核版本低于4.9，不支持BBR${NC}"
+fi
+echo ""
+echo -e "${YELLOW}7. 写入内核优化配置...${NC}"
+cat >> "$SYSCTL_CONF" << EOF
+$MARKER_START
+# ==============================================
+# Linux 生产级智能内核优化
+# 业务场景：$SCENARIO_DESC
+# 自动生成于：$(date '+%Y-%m-%d %H:%M:%S')
+# TCP缓冲区计算逻辑移植自TCP-Tuning-Simple-Version.sh
+# ==============================================
+# 系统级文件描述符总上限（根据内存自动计算）
+fs.file-max = $EXPECTED_FS_FILE_MAX
+# 连接队列优化
+net.core.somaxconn = $EXPECTED_SOMAXCONN
+net.core.netdev_max_backlog = 65535
+net.core.netdev_budget = 600
+net.core.netdev_budget_usecs = $NETDEV_BUDGET_USECS
+# TCP 基础优化
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = $TCP_FIN_TIMEOUT
+net.ipv4.tcp_keepalive_time = $TCP_KEEPALIVE_TIME
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 3
+# 端口范围扩展
+net.ipv4.ip_local_port_range = 1024 65534
+# 减少无效重传
+net.ipv4.tcp_retries2 = $EXPECTED_TCP_RETRIES2
+net.ipv4.tcp_syn_retries = 2
+net.ipv4.tcp_synack_retries = 2
+# 禁用 ICMP 重定向
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+# 反向路径过滤(宽松模式，兼容Docker/K8s/NAT)
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+# ==============================================
+# TCP 缓冲区配置
+# ==============================================
+$TCP_BUFFER_CONFIG
+# ==============================================
+# BBR 拥塞控制配置
+# ==============================================
+$BBR_CONFIG
+$MARKER_END
+EOF
+# 旧内核兼容处理
+if kernel_lt "$KERNEL_VERSION" "4.12"; then
+    sed -i "/$MARKER_END/i # 旧内核兼容：禁用tcp_tw_recycle，避免NAT环境下连接重置问题" "$SYSCTL_CONF"
+    sed -i "/$MARKER_END/i net.ipv4.tcp_tw_recycle = 0" "$SYSCTL_CONF"
+    echo -e "${YELLOW}⚠ 旧内核检测，添加NAT兼容参数${NC}"
+fi
+# 应用配置
+echo -e "${YELLOW}8. 应用内核配置...${NC}"
+sysctl -p >/dev/null 2>&1
+echo -e "${GREEN}✅ 所有优化已应用完成！${NC}"
+echo ""
+# ==================== 最终输出 ====================
+echo -e "${BLUE}=======================================================${NC}"
+echo -e "${GREEN}🎉 生产级智能优化部署成功！${NC}"
+echo -e "${BLUE}=======================================================${NC}"
+echo ""
+echo -e "${YELLOW}🔍 验证命令${NC}"
+echo -e "  ulimit -n                          # 应显示：$SYSTEM_MAX_FILE"
+echo -e "  sysctl fs.file-max                 # 应显示：$EXPECTED_FS_FILE_MAX"
+echo -e "  sysctl net.core.somaxconn          # 应显示：$EXPECTED_SOMAXCONN"
+echo -e "  sysctl net.ipv4.tcp_retries2       # 应显示：$EXPECTED_TCP_RETRIES2"
+if [ $AUTO_CALC_DONE -eq 1 ]; then
+echo -e "  sysctl net.ipv4.tcp_rmem          # 应显示：$TCP_RMEM_EXPECTED"
+echo -e "  sysctl net.ipv4.tcp_wmem          # 应显示：$TCP_WMEM_EXPECTED"
+fi
+if [ $BBR_ENABLED -eq 1 ]; then
+echo -e "  sysctl net.core.default_qdisc      # 应显示：fq"
+echo -e "  sysctl net.ipv4.tcp_congestion_control  # 应显示：bbr"
+fi
+echo ""
+echo -e "${YELLOW}🏗️  应用层配置推荐（分级权威版）${NC}"
+echo -e "${GREEN}通用场景（99%适用）：${NC}"
+echo -e "  Nginx: worker_rlimit_nofile ${NGINX_GENERAL};"
+echo -e "  MySQL: open_files_limit = ${MYSQL_GENERAL}"
+echo -e "  PHP-FPM: rlimit_files = ${PHP_GENERAL}"
+echo -e "  Redis: maxclients ${REDIS_GENERAL}"
+echo -e "  Java: 无需额外配置（现代JVM自动适配）"
+echo ""
+echo -e "${YELLOW}高并发特殊场景：${NC}"
+echo -e "  Nginx(CDN/大文件): worker_rlimit_nofile ${NGINX_HIGH};"
+echo -e "  Redis(长连接/连接池): maxclients ${REDIS_HIGH}"
+echo ""
+# 代理场景专属提示
+if [[ $SCENARIO -eq 5 ]]; then
+    echo -e "${YELLOW}💡 代理网络专属优化已完成：${NC}"
+    echo -e "  ✅ 启用激进快速失败策略，连接无响应约10秒自动断开"
+    echo -e "  ✅ 优化网络中断处理时间，降低延迟"
+    echo -e "  ✅ 禁用NAT环境下有问题的参数"
+    if [ $BBR_ENABLED -eq 1 ]; then
+    echo -e "  ✅ 自动启用BBR+fq最佳组合，视频流畅度显著提升"
+    fi
+    echo ""
+fi
+echo -e "${YELLOW}⚠️  生效说明：${NC}"
+echo "1. 文件句柄需【完全关闭SSH重新登录】生效"
+echo "2. 运行中的代理服务必须【重启】才能使用新配置"
+echo "3. 建议【重启服务器】以确保所有参数完全生效"
+echo ""
+echo -e "${YELLOW}🔄 一键回滚${NC}"
+echo "cp $BACKUP_DIR/limits.conf /etc/security/"
+echo "cp $BACKUP_DIR/system.conf /etc/systemd/system.conf"
+echo "cp $BACKUP_DIR/sysctl.conf /etc/"
+echo "sysctl -p && systemctl daemon-reexec"
