@@ -1,5 +1,5 @@
 #!/bin/bash
-# Linux 生产级智能优化脚本 v3.0.3 (移植成熟BDP缓冲区计算 | 自动BBR版)
+# Linux 生产级智能优化脚本 v3.0.4 (移植成熟BDP缓冲区计算 | 自动BBR版 | 集成iperf3)
 # 自动内存适配 | 5种业务场景 | BDP自动计算(取自TCP-Tuning-Simple-Version) | 自动去重 | 自动BBR+fq
 # 专为代理网络/视频转发优化，内核支持则自动启用BBR+fq最佳组合
 
@@ -35,6 +35,9 @@ fi
 
 # 检查并安装依赖
 install_dependencies() {
+    local deps_installed=0
+
+    # 检查 bc
     if ! command -v bc &> /dev/null; then
         echo -e "${YELLOW}⚠ 检测到系统缺少 'bc' 工具，正在尝试自动安装...${NC}"
         if command -v yum &> /dev/null; then
@@ -51,6 +54,31 @@ install_dependencies() {
             exit 1
         fi
         echo -e "${GREEN}✓ 'bc' 工具安装成功！${NC}"
+        deps_installed=1
+    fi
+
+    # 检查 iperf3
+    if ! command -v iperf3 &> /dev/null; then
+        echo -e "${YELLOW}⚠ 检测到系统缺少 'iperf3' 工具，正在尝试自动安装...${NC}"
+        if command -v yum &> /dev/null; then
+            yum install -y iperf3
+        elif command -v apt-get &> /dev/null; then
+            apt-get update && apt-get install -y iperf3
+        else
+            echo -e "${RED}错误：无法识别您的包管理器，请手动安装 'iperf3' 工具。${NC}"
+            exit 1
+        fi
+        
+        if ! command -v iperf3 &> /dev/null; then
+            echo -e "${RED}错误：'iperf3' 工具安装失败。${NC}"
+            exit 1
+        fi
+        echo -e "${GREEN}✓ 'iperf3' 工具安装成功！${NC}"
+        deps_installed=1
+    fi
+
+    if [ $deps_installed -eq 0 ]; then
+        echo -e "${GREEN}✓ 所有依赖工具均已安装。${NC}"
     fi
 }
 
@@ -113,7 +141,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo -e "${BLUE}=======================================================${NC}"
-echo -e "${BLUE} Linux 生产级智能优化脚本 v3.0.3 | 自动BBR+fq版${NC}"
+echo -e "${BLUE} Linux 生产级智能优化脚本 v3.0.4 | 自动BBR+fq版${NC}"
 echo -e "${BLUE}=======================================================${NC}"
 echo ""
 
@@ -416,31 +444,4 @@ echo -e "${GREEN}通用场景（99%适用）：${NC}"
 echo -e " Nginx: worker_rlimit_nofile ${NGINX_GENERAL};"
 echo -e " MySQL: open_files_limit = ${MYSQL_GENERAL}"
 echo -e " PHP-FPM: rlimit_files = ${PHP_GENERAL}"
-echo -e " Redis: maxclients ${REDIS_GENERAL}"
-echo -e " Java: 无需额外配置（现代JVM自动适配）"
-echo ""
-
-echo -e "${YELLOW}高并发特殊场景：${NC}"
-echo -e " Nginx(CDN/大文件): worker_rlimit_nofile ${NGINX_HIGH};"
-echo -e " Redis(长连接/连接池): maxclients ${REDIS_HIGH}"
-echo ""
-
-# 代理场景专属提示
-if [[ $SCENARIO -eq 5 ]]; then
-    echo -e "${YELLOW}💡 代理网络专属优化已完成：${NC}"
-    echo -e " ✅ 启用激进快速失败策略，连接无响应约10秒自动断开"
-    echo -e " ✅ 优化网络中断处理时间，降低延迟"
-    echo -e " ✅ 禁用NAT环境下有问题的参数"
-    if [ $BBR_ENABLED -eq 1 ]; then
-        echo -e " ✅ 自动启用BBR+fq最佳组合，视频流畅度显著提升"
-    fi
-    echo ""
-fi
-
-echo -e "${YELLOW}⚠️ 生效说明：${NC}"
-echo "1. 文件句柄需【完全关闭SSH重新登录】生效"
-echo "2. 运行中的代理服务必须【重启】才能使用新配置"
-echo "3. 建议【重启服务器】以确保所有参数完全生效"
-echo ""
-
-echo -e "${YELLOW}🔄 一键回滚${
+echo -e " Redis: maxclients ${REDIS_GENERAL
