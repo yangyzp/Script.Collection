@@ -18,9 +18,7 @@ if ! command -v bc &>/dev/null || ! command -v iperf3 &>/dev/null; then
     echo "✓ 依赖安装完成"
 fi
 # ==================== 依赖检查结束 ====================
-
-
-# Linux 生产级智能优化脚本 v3.0.5 (移植成熟BDP缓冲区计算 | 自动BBR版)
+# Linux 生产级智能优化脚本 v3.0.6 (移植成熟BDP缓冲区计算 | 自动BBR版)
 # 自动内存适配 | 5种业务场景 | BDP自动计算(取自TCP-Tuning-Simple-Version) | 自动去重 | 自动BBR+fq
 # 专为代理网络/视频转发优化，内核支持则自动启用BBR+fq最佳组合
 # 颜色定义
@@ -227,8 +225,15 @@ if [[ "$AUTO_CALC" == "y" ]]; then
     # 标准BDP计算公式 BDP(KB) = 带宽(Mbps) × RTT(ms) / 8
     bdp_kb=$(echo "scale=2; $BANDWIDTH * $RTT_MS / 8" | bc)
     bdp_mb=$(echo "scale=2; $bdp_kb / 1024" | bc)
-    # 安全系数 ×1.5
-    recommended_mb=$(echo "scale=2; $bdp_mb * 1.5" | bc)
+    # 智能动态安全系数：根据RTT自动适配
+    if (( $(echo "$RTT_MS <= 30" | bc -l) )); then
+        SAFE_FACTOR=1.5
+    elif (( $(echo "$RTT_MS <= 80" | bc -l) )); then
+        SAFE_FACTOR=2.5
+    else
+        SAFE_FACTOR=3.5
+    fi
+    recommended_mb=$(echo "scale=2; $bdp_mb * $SAFE_FACTOR" | bc)
     final_mb=$(printf "%.0f" "$recommended_mb")
     # 最小限制1MiB
     if [ "$final_mb" -lt 1 ]; then
@@ -242,18 +247,18 @@ if [[ "$AUTO_CALC" == "y" ]]; then
     TCP_WMEM_MIN=4096
     TCP_WMEM_DEFAULT=16384
     TCP_WMEM_MAX=$value_bytes
-
     TCP_RMEM_EXPECTED="$TCP_RMEM_MIN $TCP_RMEM_DEFAULT $TCP_RMEM_MAX"
     TCP_WMEM_EXPECTED="$TCP_WMEM_MIN $TCP_WMEM_DEFAULT $TCP_WMEM_MAX"
     AUTO_CALC_DONE=1
     TCP_BUFFER_CONFIG="# TCP 缓冲区优化 (${BANDWIDTH}Mbps @ ${RTT_MS}ms)
-# BDP计算值: ${bdp_mb}MB | 安全放大1.5倍推荐: ${recommended_mb}MB | 最终设置${final_mb}MiB
+# BDP计算值: ${bdp_mb}MB | 安全放大${SAFE_FACTOR}倍推荐: ${recommended_mb}MB | 最终设置${final_mb}MiB
 net.core.rmem_default = $TCP_RMEM_DEFAULT
 net.core.wmem_default = $TCP_WMEM_DEFAULT
 net.core.rmem_max = $TCP_RMEM_MAX
 net.core.wmem_max = $TCP_WMEM_MAX
 net.ipv4.tcp_rmem = $TCP_RMEM_EXPECTED
 net.ipv4.tcp_wmem = $TCP_WMEM_EXPECTED"
+    echo -e "${BLUE}  自动匹配安全系数：${SAFE_FACTOR}倍${NC}"
     echo -e "${GREEN}✓ BDP缓冲区计算完成，最终缓冲区上限：${final_mb}MiB${NC}"
 else
     # 手动默认模板（和简易脚本默认值对齐）
