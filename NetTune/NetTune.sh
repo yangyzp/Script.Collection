@@ -17,8 +17,8 @@ if ! command -v bc &>/dev/null || ! command -v iperf3 &>/dev/null; then
     echo "✓ 依赖安装完成"
 fi
 # ==================== 依赖检查结束 ====================
-# Linux 生产级智能优化脚本 v3.3.1 (低丢包优化版 | 带宽满速+低重传+低占用)
-# 修正：下调BDP缓冲区安全系数、修正BBR增益至合理区间、修复代理场景丢包参数
+# Linux 生产级智能优化脚本 v3.4.2 (代理场景专项优化版)
+# 更新：代理场景参数全面审核修正，修复tcp_mem偏小问题，新增conntrack适配
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -29,7 +29,7 @@ NC='\033[0m'
 TOTAL_MEM_MB=$(free -m | awk '/^Mem:/{print $2}')
 CPU_CORES=$(nproc)
 KERNEL_VERSION=$(uname -r | cut -d'-' -f1)
-# ==================== 硬件档位自动判定（核心：低CPU+低丢包适配） ====================
+# ==================== 硬件档位自动判定 ====================
 # 低配：1核及以下 或 内存≤1G → 极致降CPU，优先稳定性
 # 中配：2核 或 1G<内存≤2G → 平衡性能与CPU占用
 # 高配：4核及以上 或 内存>2G → 全性能模式
@@ -140,6 +140,9 @@ clean_sysctl_params() {
         "net.ipv4.tcp_timestamps"
         "net.ipv4.ip_forward"
         "net.ipv4.conf.all.forwarding"
+        "net.netfilter.nf_conntrack_max"
+        "net.netfilter.nf_conntrack_tcp_timeout_established"
+        "net.netfilter.nf_conntrack_tcp_timeout_time_wait"
     )
     for param in "${params[@]}"; do
         sed -i "/^[#]*\s*$param\s*=/d" "$1"
@@ -151,7 +154,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 echo -e "${BLUE}=======================================================${NC}"
-echo -e "${BLUE}  Linux 生产级智能优化脚本 v3.3.1 | 低丢包优化版${NC}"
+echo -e "${BLUE}  Linux 生产级智能优化脚本 v3.4.2 | 代理场景专项优化${NC}"
 echo -e "${BLUE}=======================================================${NC}"
 echo ""
 echo -e "${YELLOW}📊 服务器硬件检测${NC}"
@@ -166,15 +169,17 @@ echo "1. 高并发Web/API/反向代理"
 echo "2. 通用业务服务器 (默认)"
 echo "3. 数据库/缓存/长连接服务"
 echo "4. 批处理/大数据任务"
-echo "5. 代理网络/流量转发/视频代理 ✅ 推荐"
-read -p "请输入选项(1-5，默认2): " SCENARIO
+echo "5. 代理网络/流量转发/视频代理 ✅ 专项优化"
+echo "6. 全国多用户公网接入/通用Web服务"
+read -p "请输入选项(1-6，默认2): " SCENARIO
 SCENARIO=${SCENARIO:-2}
-# 场景参数初始化（折中平衡：速度+低重传）
+# 场景参数初始化
 NETDEV_BUDGET_USECS=4000
 TCP_KEEPALIVE_TIME=200
 TCP_EARLY_RETRANS=2
 TCP_REORDERING=8
 TCP_SLOW_START=0
+TCP_NOTSENT_LOWAT=16384
 case $SCENARIO in
     1)
         EXPECTED_TCP_RETRIES2=4
@@ -197,12 +202,25 @@ case $SCENARIO in
         SCENARIO_DESC="批处理/大数据任务"
         ;;
     5)
-        EXPECTED_TCP_RETRIES2=3
+        EXPECTED_TCP_RETRIES2=4
         TCP_FIN_TIMEOUT=8
         TCP_KEEPALIVE_TIME=100
         TCP_EARLY_RETRANS=2
         TCP_REORDERING=8
+        TCP_SLOW_START=0
+        TCP_NOTSENT_LOWAT=16384
         SCENARIO_DESC="代理网络/流量转发/视频代理"
+        ;;
+    6)
+        EXPECTED_TCP_RETRIES2=6
+        TCP_FIN_TIMEOUT=12
+        TCP_KEEPALIVE_TIME=180
+        TCP_EARLY_RETRANS=2
+        TCP_REORDERING=5
+        TCP_SLOW_START=1
+        TCP_NOTSENT_LOWAT=-1
+        BUSY_POLL_ENABLE=0
+        SCENARIO_DESC="全国多用户公网接入/通用Web服务"
         ;;
     *)
         EXPECTED_TCP_RETRIES2=6
@@ -222,6 +240,7 @@ TCP_MEM_EXPECTED=""
 BBR_ENABLED=0
 PROXY_EXTRA_CONFIG=""
 BUSY_POLL_CONFIG=""
+CONNTRACK_CONFIG=""
 echo -e "${YELLOW}1. 备份原始配置...${NC}"
 mkdir -p "$BACKUP_DIR"
 cp "$LIMITS_CONF" "$BACKUP_DIR/"
@@ -266,58 +285,97 @@ else
     echo -e "${YELLOW}⚠ 未检测到systemd，跳过${NC}"
 fi
 echo ""
-echo -e "${YELLOW}5. TCP缓冲区自动计算（低丢包版：平衡速度与重传）${NC}"
+echo -e "${YELLOW}5. TCP缓冲区自动计算${NC}"
 TCP_BUFFER_CONFIG=""
 AUTO_CALC_DONE=0
-# 带宽手动输入
-while true; do
-    read -p "输入服务器带宽(Mbps，如70/100/500): " BANDWIDTH
-    if [[ "$BANDWIDTH" =~ ^[0-9]*\.?[0-9]+$ ]] && (( $(echo "$BANDWIDTH > 0 && $BANDWIDTH <= 10000" | bc -l) )); then
-        break
-    fi
-    echo -e "${RED}请输入有效带宽数字(0~10000)${NC}"
-done
-# RTT延迟输入校验
-while true; do
-    read -p "输入平均延迟(ms，如50/100/200): " RTT_MS
-    if [[ "$RTT_MS" =~ ^[0-9]*\.?[0-9]+$ ]] && (( $(echo "$RTT_MS > 0 && $RTT_MS <= 1000" | bc -l) )); then
-        break
-    fi
-    echo -e "${RED}请输入有效延迟数字(0~1000)${NC}"
-done
-# BDP标准计算公式
-bdp_kb=$(echo "scale=4; $BANDWIDTH * $RTT_MS / 8" | bc)
-bdp_mb=$(echo "scale=4; $bdp_kb / 1024" | bc)
-# 修正：保守安全系数，优先控制队列积压与丢包
-if (( $(echo "$BANDWIDTH <= 100" | bc -l) )); then
+
+# ========== 场景6：全国多用户，免RTT输入，保守自动配置 ==========
+if [[ "$SCENARIO" == "6" ]]; then
+    # 仅输入服务器出口带宽
+    while true; do
+        read -p "输入服务器带宽(Mbps，如70/100/500): " BANDWIDTH
+        if [[ "$BANDWIDTH" =~ ^[0-9]*\.?[0-9]+$ ]] && (( $(echo "$BANDWIDTH > 0 && $BANDWIDTH <= 10000" | bc -l) )); then
+            break
+        fi
+        echo -e "${RED}请输入有效带宽数字(0~10000)${NC}"
+    done
+
+    RTT_MS="自适应"
     SAFE_FACTOR=1.2
-elif (( $(echo "$BANDWIDTH <= 500" | bc -l) )); then
-    SAFE_FACTOR=1.4
-elif (( $(echo "$BANDWIDTH <= 1000" | bc -l) )); then
-    SAFE_FACTOR=1.6
+
+    # 按硬件档位设定保守缓冲区上限
+    if [ "$HARDWARE_TIER" = "low" ]; then
+        final_mb=4
+    elif [ "$HARDWARE_TIER" = "mid" ]; then
+        final_mb=8
+    else
+        final_mb=16
+    fi
+    # 100M以下小带宽再减半，进一步避免队列积压
+    if (( $(echo "$BANDWIDTH <= 100" | bc -l) )); then
+        final_mb=$(( final_mb / 2 ))
+        [ "$final_mb" -lt 1 ] && final_mb=1
+    fi
+
+    value_bytes=$(( final_mb * 1024 * 1024 ))
+    echo -e "${BLUE}  多用户场景：内核自动适配各地区链路RTT，采用保守缓冲区上限${NC}"
+    echo -e "${GREEN}✓ 缓冲区上限设定：${final_mb}MiB${NC}"
+
+# ========== 其他场景：保留带宽+RTT输入，BDP精确计算 ==========
 else
-    SAFE_FACTOR=1.8
+    # 带宽手动输入
+    while true; do
+        read -p "输入服务器带宽(Mbps，如70/100/500): " BANDWIDTH
+        if [[ "$BANDWIDTH" =~ ^[0-9]*\.?[0-9]+$ ]] && (( $(echo "$BANDWIDTH > 0 && $BANDWIDTH <= 10000" | bc -l) )); then
+            break
+        fi
+        echo -e "${RED}请输入有效带宽数字(0~10000)${NC}"
+    done
+    # RTT延迟输入校验
+    while true; do
+        read -p "输入平均延迟(ms，如50/100/200): " RTT_MS
+        if [[ "$RTT_MS" =~ ^[0-9]*\.?[0-9]+$ ]] && (( $(echo "$RTT_MS > 0 && $RTT_MS <= 1000" | bc -l) )); then
+            break
+        fi
+        echo -e "${RED}请输入有效延迟数字(0~1000)${NC}"
+    done
+    # BDP标准计算公式
+    bdp_kb=$(echo "scale=4; $BANDWIDTH * $RTT_MS / 8" | bc)
+    bdp_mb=$(echo "scale=4; $bdp_kb / 1024" | bc)
+    # 安全系数：按带宽分档，优先控制队列积压与丢包
+    if (( $(echo "$BANDWIDTH <= 100" | bc -l) )); then
+        SAFE_FACTOR=1.2
+    elif (( $(echo "$BANDWIDTH <= 500" | bc -l) )); then
+        SAFE_FACTOR=1.4
+    elif (( $(echo "$BANDWIDTH <= 1000" | bc -l) )); then
+        SAFE_FACTOR=1.6
+    else
+        SAFE_FACTOR=1.8
+    fi
+    # 内存自适应封顶
+    recommended_mb=$(echo "scale=2; $bdp_mb * $SAFE_FACTOR" | bc)
+    final_mb=$(printf "%.0f" "$recommended_mb")
+    if [ "$final_mb" -lt 1 ]; then
+        final_mb=1
+    fi
+    value_bytes=$(echo "$final_mb * 1024 * 1024" | bc)
+    # 缓冲区硬封顶（按硬件档位）
+    if [ "$HARDWARE_TIER" = "low" ]; then
+        MAX_BUFFER_BYTES=$(( 8 * 1024 * 1024 ))
+    elif [ "$HARDWARE_TIER" = "mid" ]; then
+        MAX_BUFFER_BYTES=$(( 16 * 1024 * 1024 ))
+    else
+        MAX_BUFFER_BYTES=$(( 32 * 1024 * 1024 ))
+    fi
+    if [ $value_bytes -gt $MAX_BUFFER_BYTES ]; then
+        value_bytes=$MAX_BUFFER_BYTES
+        final_mb=$(( MAX_BUFFER_BYTES / 1024 / 1024 ))
+    fi
+    echo -e "${BLUE}  安全系数：${SAFE_FACTOR}倍${NC}"
+    echo -e "${GREEN}✓ BDP缓冲区计算完成，最终上限：${final_mb}MiB${NC}"
 fi
-# 内存自适应封顶（按硬件档位）
-recommended_mb=$(echo "scale=2; $bdp_mb * $SAFE_FACTOR" | bc)
-final_mb=$(printf "%.0f" "$recommended_mb")
-if [ "$final_mb" -lt 1 ]; then
-    final_mb=1
-fi
-value_bytes=$(echo "$final_mb * 1024 * 1024" | bc)
-# 缓冲区硬封顶（按硬件档位）
-if [ "$HARDWARE_TIER" = "low" ]; then
-    MAX_BUFFER_BYTES=$(( 8 * 1024 * 1024 ))
-elif [ "$HARDWARE_TIER" = "mid" ]; then
-    MAX_BUFFER_BYTES=$(( 16 * 1024 * 1024 ))
-else
-    MAX_BUFFER_BYTES=$(( 32 * 1024 * 1024 ))
-fi
-if [ $value_bytes -gt $MAX_BUFFER_BYTES ]; then
-    value_bytes=$MAX_BUFFER_BYTES
-    final_mb=$(( MAX_BUFFER_BYTES / 1024 / 1024 ))
-fi
-# 三段式缓冲区（收发对称）
+
+# 三段式缓冲区（收发对称，通用逻辑）
 TCP_RMEM_MIN=4096
 TCP_WMEM_MIN=4096
 calc_default=$(echo "$value_bytes / 4" | bc)
@@ -333,8 +391,9 @@ TCP_WMEM_MAX=$value_bytes
 TCP_RMEM_EXPECTED="$TCP_RMEM_MIN $TCP_RMEM_DEFAULT $TCP_RMEM_MAX"
 TCP_WMEM_EXPECTED="$TCP_WMEM_MIN $TCP_WMEM_DEFAULT $TCP_WMEM_MAX"
 AUTO_CALC_DONE=1
-TCP_BUFFER_CONFIG="# TCP 缓冲区优化 (低丢包版 | ${BANDWIDTH}Mbps @ ${RTT_MS}ms)
-# BDP计算值: ${bdp_mb}MB | 安全放大${SAFE_FACTOR}倍 | 最终设置${final_mb}MiB
+
+TCP_BUFFER_CONFIG="# TCP 缓冲区优化 (${SCENARIO_DESC} | ${BANDWIDTH}Mbps @ ${RTT_MS}ms)
+# 安全放大${SAFE_FACTOR}倍 | 最终设置${final_mb}MiB
 net.core.rmem_default = $TCP_RMEM_DEFAULT
 net.core.wmem_default = $TCP_WMEM_DEFAULT
 net.core.rmem_max = $TCP_RMEM_MAX
@@ -345,52 +404,69 @@ net.ipv4.tcp_wmem = $TCP_WMEM_EXPECTED
 net.ipv4.tcp_early_retrans = $TCP_EARLY_RETRANS
 net.ipv4.tcp_reordering = $TCP_REORDERING
 net.ipv4.tcp_slow_start_after_idle = $TCP_SLOW_START
-net.ipv4.tcp_notsent_lowat = 16384"
-# 高配机才开启busy poll，低配默认关闭省CPU
+net.ipv4.tcp_notsent_lowat = $TCP_NOTSENT_LOWAT"
+
+# 高配机才开启busy poll，低配/多用户场景默认关闭省CPU
 if [ $BUSY_POLL_ENABLE -eq 1 ]; then
-    BUSY_POLL_CONFIG="# 高配低延迟优化（CPU占用较高）
+    BUSY_POLL_CONFIG="# 高配低延迟优化（CPU占用较高，仅局域网推荐）
 net.core.busy_read = 512
 net.core.busy_poll = 512"
 fi
-echo -e "${BLUE}  保守安全系数：${SAFE_FACTOR}倍（优先控制丢包）${NC}"
-echo -e "${GREEN}✓ BDP缓冲区计算完成，最终上限：${final_mb}MiB${NC}"
-# 全局TCP内存限制（按硬件档位，单位：页，1页=4KB）
-if [ "$HARDWARE_TIER" = "low" ]; then
-    TCP_MEM_EXPECTED="4096 8192 16384"
-elif [ "$HARDWARE_TIER" = "mid" ]; then
-    TCP_MEM_EXPECTED="8192 16384 32768"
-else
-    TCP_MEM_EXPECTED="16384 32768 65536"
-fi
-# 500M以上带宽同步放宽
+
+# ========== 全局TCP内存限制（按系统总内存动态计算，修复原固定值偏小问题） ==========
+# 单位：页，1页=4KB；比例：总内存的1/16(低压)、1/12(压力)、1/8(上限)
+total_pages=$(( TOTAL_MEM_MB * 1024 / 4 ))
+tcp_mem_low=$(( total_pages / 16 ))
+tcp_mem_pressure=$(( total_pages / 12 ))
+tcp_mem_high=$(( total_pages / 8 ))
+TCP_MEM_EXPECTED="$tcp_mem_low $tcp_mem_pressure $tcp_mem_high"
+
+# 500M以上大带宽额外放宽10%
 if (( $(echo "$BANDWIDTH >= 500" | bc -l) )); then
-    TCP_MEM_EXPECTED=$(echo "$TCP_MEM_EXPECTED" | awk '{print $1*1.3 " " $2*1.3 " " $3*1.3}' | xargs printf "%.0f %.0f %.0f")
+    tcp_mem_low=$(echo "$tcp_mem_low * 1.1" | bc | xargs printf "%.0f")
+    tcp_mem_pressure=$(echo "$tcp_mem_pressure * 1.1" | bc | xargs printf "%.0f")
+    tcp_mem_high=$(echo "$tcp_mem_high * 1.1" | bc | xargs printf "%.0f")
+    TCP_MEM_EXPECTED="$tcp_mem_low $tcp_mem_pressure $tcp_mem_high"
 fi
+
 TCP_BUFFER_CONFIG="$TCP_BUFFER_CONFIG
 $BUSY_POLL_CONFIG
 net.ipv4.tcp_mem = $TCP_MEM_EXPECTED"
-# 代理场景专属参数
+
+# ========== 代理场景专属参数 ==========
 if [[ "$SCENARIO" == "5" ]]; then
     PROXY_EXTRA_CONFIG="# 代理中转专属优化
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.forwarding = 1"
+
+    # 自动检测并配置conntrack连接跟踪表
+    if lsmod | grep -q nf_conntrack || modprobe nf_conntrack 2>/dev/null; then
+        # 连接跟踪表上限按内存配比：每1MB内存约8条连接
+        conntrack_max=$(( TOTAL_MEM_MB * 8 ))
+        [ $conntrack_max -lt 8192 ] && conntrack_max=8192
+        CONNTRACK_CONFIG="# 连接跟踪表优化（四层转发/代理必备）
+net.netfilter.nf_conntrack_max = $conntrack_max
+net.netfilter.nf_conntrack_tcp_timeout_established = 3600
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 120"
+        echo -e "${GREEN}✓ 已检测到nf_conntrack模块，同步优化连接跟踪表${NC}"
+    fi
 fi
 echo ""
-echo -e "${YELLOW}6. 自动配置BBR+fq拥塞控制（保守增益降丢包）${NC}"
+echo -e "${YELLOW}6. 自动配置BBR+fq拥塞控制${NC}"
 BBR_CONFIG=""
 if ! kernel_lt "$KERNEL_VERSION" "4.9"; then
     modprobe tcp_bbr 2>/dev/null
     modprobe sch_fq 2>/dev/null
     if lsmod | grep -q bbr; then
-        BBR_CONFIG="# BBR 拥塞控制 + fq 队列（${TIER_DESC} | 保守增益）
+        BBR_CONFIG="# BBR 拥塞控制 + fq 队列（${TIER_DESC}）
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-# BBR增益分档：低配平稳省CPU，高配平衡速度与丢包
+# BBR增益分档
 net.ipv4.tcp_bbr_cwnd_gain = $BBR_CWND_GAIN
 net.ipv4.tcp_bbr_bw_gain = $BBR_BW_GAIN"
         BBR_ENABLED=1
-        echo -e "${GREEN}✓ 内核支持，已启用BBR+fq（保守增益参数）${NC}"
+        echo -e "${GREEN}✓ 内核支持，已启用BBR+fq${NC}"
     else
         echo -e "${YELLOW}⚠ BBR模块加载失败，将使用默认拥塞控制${NC}"
     fi
@@ -402,7 +478,7 @@ echo -e "${YELLOW}7. 写入内核优化配置...${NC}"
 cat >> "$SYSCTL_CONF" << EOF
 $MARKER_START
 # ==============================================
-# Linux 内核优化配置（低丢包版）
+# Linux 内核优化配置
 # 业务场景：$SCENARIO_DESC
 # 硬件档位：$TIER_DESC
 # 带宽适配：${BANDWIDTH}Mbps | 延迟适配：${RTT_MS}ms
@@ -410,7 +486,7 @@ $MARKER_START
 # ==============================================
 # 系统文件描述符总上限
 fs.file-max = $EXPECTED_FS_FILE_MAX
-# 连接队列优化（分档降CPU）
+# 连接队列优化
 net.core.somaxconn = $EXPECTED_SOMAXCONN
 net.core.netdev_max_backlog = $NETDEV_MAX_BACKLOG
 net.core.netdev_budget = $NETDEV_BUDGET
@@ -433,11 +509,11 @@ net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
-# 反向路径过滤(宽松模式，兼容Docker/NAT)
+# 反向路径过滤(宽松模式，兼容Docker/NAT/转发)
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
 # ==============================================
-# TCP 缓冲区配置（低丢包BDP版）
+# TCP 缓冲区配置
 # ==============================================
 $TCP_BUFFER_CONFIG
 # ==============================================
@@ -445,6 +521,7 @@ $TCP_BUFFER_CONFIG
 # ==============================================
 $BBR_CONFIG
 $PROXY_EXTRA_CONFIG
+$CONNTRACK_CONFIG
 $MARKER_END
 EOF
 # 旧内核兼容处理
@@ -477,6 +554,9 @@ if [ $BBR_ENABLED -eq 1 ]; then
 echo -e "  sysctl net.core.default_qdisc      # 应显示：fq"
 echo -e "  sysctl net.ipv4.tcp_congestion_control  # 应显示：bbr"
 fi
+if [[ "$SCENARIO" == "5" && -n "$CONNTRACK_CONFIG" ]]; then
+echo -e "  sysctl net.netfilter.nf_conntrack_max # 连接跟踪表上限"
+fi
 echo ""
 echo -e "${YELLOW}🏗️  应用层配置推荐${NC}"
 echo -e "${GREEN}通用场景：${NC}"
@@ -486,14 +566,26 @@ echo -e "  PHP-FPM: rlimit_files = ${PHP_GENERAL}"
 echo -e "  Redis: maxclients ${REDIS_GENERAL}"
 echo ""
 echo -e "${YELLOW}💡 本次优化核心${NC}"
+if [[ "$SCENARIO" == "5" ]]; then
+echo -e "  ✅ 转发基础参数全适配，兼容四层/七层代理场景"
+echo -e "  ✅ 保守BDP缓冲区，减少中转链路队列积压丢包"
+echo -e "  ✅ BBR合理增益，跨运营商链路速度更稳定"
+echo -e "  ✅ 动态TCP内存与连接跟踪表，支撑高并发转发"
+elif [[ "$SCENARIO" == "6" ]]; then
+echo -e "  ✅ 容量类参数拉满，提升并发承载能力"
+echo -e "  ✅ 传输参数保守，兼容全国不同地域网络"
+echo -e "  ✅ 移除激进优化，优先保证整体稳定性"
+echo -e "  ✅ 硬件自动适配，精准控制CPU资源占用"
+else
 echo -e "  ✅ 硬件自动适配：${TIER_DESC}，CPU开销精准控制"
-echo -e "  ✅ 保守BDP缓冲区：大幅降低队列积压，减少丢包重传"
-echo -e "  ✅ BBR保守增益：控制在途数据量，平衡速度与丢包率"
+echo -e "  ✅ 保守BDP缓冲区：降低队列积压，减少丢包重传"
+echo -e "  ✅ BBR合理增益：平衡速度与丢包率"
 echo -e "  ✅ 队列深度分级：低配减少软中断，降低CPU占用"
+fi
 echo ""
 echo -e "${YELLOW}⚠️  生效说明：${NC}"
 echo "1. 文件句柄需【关闭SSH重新登录】生效"
-echo "2. 运行中的代理/WEB服务必须【重启】才能使用新配置"
+echo "2. 运行中的代理/转发服务必须【重启】才能使用新配置"
 echo "3. 建议【重启服务器】确保所有参数完全生效"
 echo ""
 echo -e "${YELLOW}🔄 一键回滚${NC}"
