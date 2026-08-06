@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==================================================================
-# NetTune.sh v4.1.0 - Linux 生产服务器网络调优脚本
+# NetTune.sh v4.4.0 - Linux 生产服务器网络调优脚本
 #
 # 场景：
 #   1. 高并发 Web/API/反向代理
@@ -10,14 +10,17 @@
 #   5. gost 中转/落地代理（用户 -> 中转 -> 落地）
 #   6. 多用户直连代理（用户 -> 服务器）
 #
-# v4.1.0 主要调整：
+# v4.4.0 主要调整：
 #   - 保留 /etc/sysctl.conf 单文件集中管理方式
 #   - 移除通用 tcp_mem 三档、busy_poll、tcp_notsent_lowat
 #   - 不再修改 tcp_syn_retries/tcp_synack_retries
 #   - 普通 gost 模式默认不启用 ip_forward/conntrack 专项参数
 #   - 模式 5 按两段链路的瓶颈带宽和较大 P95 RTT 计算缓冲区
 #   - 模式 6 可输入用户侧 P95 RTT，默认 200ms
-#   - 保留系统现有 TCP min/default，只按需提高 max
+#   - TCP rmem/wmem 的 max 计算逻辑与 TCP-Tuning-Simple-Version.sh 一致
+#   - tcp_rmem default 固定为 131072，提升新连接的初始接收缓冲区
+#   - tcp_wmem 保留系统当前 min/default
+#   - 已有更高的 TCP max 不降低，只在计算值更高时提升
 #   - 文件句柄、somaxconn、socket max 只升不降
 #   - 模式 5、6 可选提高 tcp_mem 全局水位，默认保持内核自动
 # ==================================================================
@@ -61,7 +64,7 @@ if [ "$(id -u)" -ne 0 ]; then
     die "必须以 root 权限运行"
 fi
 
-for command_name in awk cat cp cut free getconf grep mkdir nproc rm sed sysctl touch uname; do
+for command_name in awk bc cat cp cut free getconf grep mkdir nproc rm sed sysctl touch uname; do
     command -v "$command_name" >/dev/null 2>&1 || die "缺少必要命令：$command_name"
 done
 
@@ -116,6 +119,28 @@ read_number() {
         fi
         log_warn "请输入大于 0 且不超过 $max_value 的数字"
     done
+}
+
+# 与 TCP-Tuning-Simple-Version.sh 的 bdp_auto_calculate 保持完全相同：
+#   1. BDP(KB) = Mbps × RTT(ms) ÷ 8
+#   2. BDP(MB) = BDP(KB) ÷ 1024
+#   3. 建议值 = BDP(MB) × 1.5
+#   4. 四舍五入到整数 MiB，最小 1 MiB
+simple_buffer_mib() {
+    local bandwidth="$1"
+    local rtt_ms="$2"
+    local bdp_kb bdp_mb recommended_mb final_mb
+
+    bdp_kb=$(echo "scale=2; $bandwidth * $rtt_ms / 8" | bc)
+    bdp_mb=$(echo "scale=2; $bdp_kb / 1024" | bc)
+    recommended_mb=$(echo "scale=2; $bdp_mb * 1.5" | bc)
+    final_mb=$(printf "%.0f" "$recommended_mb")
+
+    if [ "$final_mb" -lt 1 ]; then
+        final_mb=1
+    fi
+
+    printf '%s\n' "$final_mb"
 }
 
 kernel_lt() {
@@ -237,8 +262,6 @@ if [ "$CPU_CORES" -le 1 ] || [ "$TOTAL_MEM_MB" -le 1024 ]; then
     NETDEV_MAX_BACKLOG=2048
     NETDEV_BUDGET=300
     NETDEV_BUDGET_USECS=2000
-    STANDARD_BUFFER_CAP_MB=8
-    PROXY_BUFFER_CAP_MB=16
 elif [ "$CPU_CORES" -le 3 ] || [ "$TOTAL_MEM_MB" -le 2048 ]; then
     HARDWARE_TIER="mid"
     TIER_DESC="中配模式（性能与资源平衡）"
@@ -247,8 +270,6 @@ elif [ "$CPU_CORES" -le 3 ] || [ "$TOTAL_MEM_MB" -le 2048 ]; then
     NETDEV_MAX_BACKLOG=4096
     NETDEV_BUDGET=300
     NETDEV_BUDGET_USECS=2000
-    STANDARD_BUFFER_CAP_MB=16
-    PROXY_BUFFER_CAP_MB=32
 else
     HARDWARE_TIER="high"
     TIER_DESC="高配模式（4核以上且内存充足）"
@@ -257,12 +278,10 @@ else
     NETDEV_MAX_BACKLOG=8192
     NETDEV_BUDGET=600
     NETDEV_BUDGET_USECS=4000
-    STANDARD_BUFFER_CAP_MB=32
-    PROXY_BUFFER_CAP_MB=64
 fi
 
 echo -e "${BLUE}=======================================================${NC}"
-echo -e "${BLUE} NetTune.sh v4.1.0 | Linux 生产网络调优${NC}"
+echo -e "${BLUE} NetTune.sh v4.4.0 | Linux 生产网络调优${NC}"
 echo -e "${BLUE}=======================================================${NC}"
 echo -e "CPU：${GREEN}${CPU_CORES} 核${NC}"
 echo -e "可用内存判定：${GREEN}${TOTAL_MEM_MB} MiB${NC}"
@@ -291,7 +310,6 @@ case "$SCENARIO" in
         TCP_TW_REUSE=1
         IP_LOCAL_PORT_RANGE="10000 65535"
         EXPECTED_SOMAXCONN=$(( BASE_SOMAXCONN * 2 ))
-        BUFFER_CAP_MB="$STANDARD_BUFFER_CAP_MB"
         ;;
     2)
         SCENARIO_DESC="通用业务服务器"
@@ -304,7 +322,6 @@ case "$SCENARIO" in
         TCP_TW_REUSE=0
         IP_LOCAL_PORT_RANGE="32768 60999"
         EXPECTED_SOMAXCONN="$BASE_SOMAXCONN"
-        BUFFER_CAP_MB="$STANDARD_BUFFER_CAP_MB"
         ;;
     3)
         SCENARIO_DESC="数据库/缓存/长连接服务"
@@ -317,7 +334,6 @@ case "$SCENARIO" in
         TCP_TW_REUSE=0
         IP_LOCAL_PORT_RANGE="32768 60999"
         EXPECTED_SOMAXCONN="$BASE_SOMAXCONN"
-        BUFFER_CAP_MB="$STANDARD_BUFFER_CAP_MB"
         ;;
     4)
         SCENARIO_DESC="批处理/大数据任务"
@@ -330,7 +346,6 @@ case "$SCENARIO" in
         TCP_TW_REUSE=1
         IP_LOCAL_PORT_RANGE="10000 65535"
         EXPECTED_SOMAXCONN="$BASE_SOMAXCONN"
-        BUFFER_CAP_MB="$PROXY_BUFFER_CAP_MB"
         ;;
     5)
         SCENARIO_DESC="gost 中转/落地代理"
@@ -343,7 +358,6 @@ case "$SCENARIO" in
         TCP_TW_REUSE=1
         IP_LOCAL_PORT_RANGE="10000 65535"
         EXPECTED_SOMAXCONN=$(( BASE_SOMAXCONN * 2 ))
-        BUFFER_CAP_MB="$PROXY_BUFFER_CAP_MB"
         ;;
     6)
         SCENARIO_DESC="多用户直连代理"
@@ -356,7 +370,6 @@ case "$SCENARIO" in
         TCP_TW_REUSE=1
         IP_LOCAL_PORT_RANGE="10000 65535"
         EXPECTED_SOMAXCONN=$(( BASE_SOMAXCONN * 2 ))
-        BUFFER_CAP_MB="$PROXY_BUFFER_CAP_MB"
         ;;
     *)
         log_warn "无效选项，使用模式 2"
@@ -371,13 +384,11 @@ case "$SCENARIO" in
         TCP_TW_REUSE=0
         IP_LOCAL_PORT_RANGE="32768 60999"
         EXPECTED_SOMAXCONN="$BASE_SOMAXCONN"
-        BUFFER_CAP_MB="$STANDARD_BUFFER_CAP_MB"
         ;;
 esac
 
 [ "$EXPECTED_SOMAXCONN" -gt 65535 ] && EXPECTED_SOMAXCONN=65535
 
-SAFE_FACTOR=2.0
 ENABLE_KERNEL_FORWARDING=0
 TCP_MEM_CONFIG=""
 TCP_MEM_DESC="内核自动（不写 tcp_mem）"
@@ -451,7 +462,7 @@ if [ "$SCENARIO" = "5" ]; then
     echo -e "${YELLOW}模式 5 使用整条中转链路的瓶颈带宽和较大 P95 RTT。${NC}"
     read_number "两段链路的瓶颈单连接带宽 Mbps" "100" "10000" BANDWIDTH
     read_number "两段链路中较大的 P95 RTT ms" "100" "1000" RTT_MS
-    DESIRED_BUFFER_BYTES=$(awk "BEGIN { printf \"%.0f\", $BANDWIDTH * $RTT_MS * 125 * $SAFE_FACTOR }")
+    FINAL_BUFFER_MB=$(simple_buffer_mib "$BANDWIDTH" "$RTT_MS")
     BANDWIDTH_DISPLAY="${BANDWIDTH}Mbps"
     RTT_DISPLAY="${RTT_MS}ms"
 
@@ -469,22 +480,16 @@ else
     else
         read_number "主要链路的 P95 RTT ms" "100" "1000" RTT_MS
     fi
-    DESIRED_BUFFER_BYTES=$(awk "BEGIN { printf \"%.0f\", $BANDWIDTH * $RTT_MS * 125 * $SAFE_FACTOR }")
+    FINAL_BUFFER_MB=$(simple_buffer_mib "$BANDWIDTH" "$RTT_MS")
     BANDWIDTH_DISPLAY="${BANDWIDTH}Mbps"
     RTT_DISPLAY="${RTT_MS}ms"
 fi
 
-BUFFER_CAP_BYTES=$(( BUFFER_CAP_MB * 1024 * 1024 ))
-if [ "$DESIRED_BUFFER_BYTES" -gt "$BUFFER_CAP_BYTES" ]; then
-    DESIRED_BUFFER_BYTES="$BUFFER_CAP_BYTES"
-    BUFFER_WAS_CAPPED=1
-else
-    BUFFER_WAS_CAPPED=0
-fi
+DESIRED_BUFFER_BYTES=$(( FINAL_BUFFER_MB * 1024 * 1024 ))
 
+# Simple 版只计算 max；rmem default 固定 131072，其他值尽量保留。
 read -r CUR_TCP_RMEM_MIN CUR_TCP_RMEM_DEFAULT CUR_TCP_RMEM_MAX <<< "$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || echo '4096 131072 6291456')"
 read -r CUR_TCP_WMEM_MIN CUR_TCP_WMEM_DEFAULT CUR_TCP_WMEM_MAX <<< "$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || echo '4096 16384 4194304')"
-
 for value_name in CUR_TCP_RMEM_MIN CUR_TCP_RMEM_DEFAULT CUR_TCP_RMEM_MAX CUR_TCP_WMEM_MIN CUR_TCP_WMEM_DEFAULT CUR_TCP_WMEM_MAX; do
     value=${!value_name}
     is_uint "$value" || die "无法解析系统 TCP 缓冲区参数：$value_name=$value"
@@ -497,9 +502,8 @@ CORE_WMEM_CURRENT=$(get_sysctl_uint net.core.wmem_max 212992)
 CORE_RMEM_MAX=$(max_int "$CORE_RMEM_CURRENT" "$TCP_RMEM_MAX")
 CORE_WMEM_MAX=$(max_int "$CORE_WMEM_CURRENT" "$TCP_WMEM_MAX")
 
-TCP_RMEM_EXPECTED="$CUR_TCP_RMEM_MIN $CUR_TCP_RMEM_DEFAULT $TCP_RMEM_MAX"
+TCP_RMEM_EXPECTED="$CUR_TCP_RMEM_MIN 131072 $TCP_RMEM_MAX"
 TCP_WMEM_EXPECTED="$CUR_TCP_WMEM_MIN $CUR_TCP_WMEM_DEFAULT $TCP_WMEM_MAX"
-FINAL_BUFFER_MB=$(awk "BEGIN { printf \"%.1f\", $DESIRED_BUFFER_BYTES / 1048576 }")
 
 CURRENT_FS_FILE_MAX=$(get_sysctl_uint fs.file-max 0)
 TARGET_FS_FILE_MAX=$(( SYSTEM_MAX_FILE * 4 ))
@@ -619,7 +623,7 @@ log_info "写入 $SYSCTL_CONF ..."
 cat >> "$SYSCTL_CONF" <<EOF
 $MARKER_START
 # =====================================================
-# NetTune.sh v4.1.0
+# NetTune.sh v4.4.0
 # 场景：$SCENARIO_DESC
 # 硬件：$TIER_DESC
 # 带宽：$BANDWIDTH_DISPLAY
@@ -654,7 +658,7 @@ net.ipv4.conf.default.send_redirects = 0
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
 
-# TCP 缓冲区：保留系统 min/default，仅按 BDP 提高 max
+# TCP 缓冲区：Simple 版算法计算 max，rmem default 固定 131072
 net.core.rmem_max = $CORE_RMEM_MAX
 net.core.wmem_max = $CORE_WMEM_MAX
 net.ipv4.tcp_rmem = $TCP_RMEM_EXPECTED
@@ -688,23 +692,19 @@ fi
 
 echo ""
 echo -e "${BLUE}=======================================================${NC}"
-echo -e "${GREEN}NetTune.sh v4.1.0 部署完成${NC}"
+echo -e "${GREEN}NetTune.sh v4.4.0 部署完成${NC}"
 echo -e "${BLUE}=======================================================${NC}"
 echo "场景：$SCENARIO_DESC"
 echo "硬件：$TIER_DESC"
 echo "带宽：$BANDWIDTH_DISPLAY"
 echo "RTT：$RTT_DISPLAY"
-echo "计算缓冲区：${FINAL_BUFFER_MB} MiB，档位封顶 ${BUFFER_CAP_MB} MiB"
+echo "计算缓冲区 max：${FINAL_BUFFER_MB} MiB（TCP-Tuning-Simple-Version 算法）"
 echo "最终 tcp_rmem：$TCP_RMEM_EXPECTED"
 echo "最终 tcp_wmem：$TCP_WMEM_EXPECTED"
 echo "TCP 内存余量：$TCP_MEM_DESC"
 [ -n "$TCP_MEM_EXPECTED" ] && echo "最终 tcp_mem：$TCP_MEM_EXPECTED"
 echo "somaxconn：$EXPECTED_SOMAXCONN"
 echo "nofile：$SYSTEM_MAX_FILE"
-
-if [ "$BUFFER_WAS_CAPPED" -eq 1 ]; then
-    log_warn "BDP 计算结果超过当前硬件档位封顶；高带宽单流可能无法完全跑满"
-fi
 
 if [ "$BBR_ENABLED" -eq 1 ]; then
     echo "拥塞控制：BBR + fq（新建连接生效）"
