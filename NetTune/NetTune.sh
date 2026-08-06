@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==================================================================
-# NetTune.sh v4.4.0 - Linux 生产服务器网络调优脚本
+# NetTune.sh v4.4.1 - Linux 生产服务器网络调优脚本
 #
 # 场景：
 #   1. 高并发 Web/API/反向代理
@@ -10,7 +10,7 @@
 #   5. gost 中转/落地代理（用户 -> 中转 -> 落地）
 #   6. 多用户直连代理（用户 -> 服务器）
 #
-# v4.4.0 主要调整：
+# v4.4.1 主要调整：
 #   - 保留 /etc/sysctl.conf 单文件集中管理方式
 #   - 移除通用 tcp_mem 三档、busy_poll、tcp_notsent_lowat
 #   - 不再修改 tcp_syn_retries/tcp_synack_retries
@@ -23,6 +23,7 @@
 #   - 已有更高的 TCP max 不降低，只在计算值更高时提升
 #   - 文件句柄、somaxconn、socket max 只升不降
 #   - 模式 5、6 可选提高 tcp_mem 全局水位，默认保持内核自动
+#   - 使用 awk 复刻 Simple 版 BDP 取整，无需 bc 依赖
 # ==================================================================
 
 set -Eeuo pipefail
@@ -64,7 +65,7 @@ if [ "$(id -u)" -ne 0 ]; then
     die "必须以 root 权限运行"
 fi
 
-for command_name in awk bc cat cp cut free getconf grep mkdir nproc rm sed sysctl touch uname; do
+for command_name in awk cat cp cut free getconf grep mkdir nproc rm sed sysctl touch uname; do
     command -v "$command_name" >/dev/null 2>&1 || die "缺少必要命令：$command_name"
 done
 
@@ -121,19 +122,28 @@ read_number() {
     done
 }
 
-# 与 TCP-Tuning-Simple-Version.sh 的 bdp_auto_calculate 保持完全相同：
+# 与 TCP-Tuning-Simple-Version.sh 的 bdp_auto_calculate 保持相同：
 #   1. BDP(KB) = Mbps × RTT(ms) ÷ 8
 #   2. BDP(MB) = BDP(KB) ÷ 1024
 #   3. 建议值 = BDP(MB) × 1.5
 #   4. 四舍五入到整数 MiB，最小 1 MiB
+# Simple 版每一步都通过 bc scale=2 截断；这里用 awk 做相同的两位小数截断。
 simple_buffer_mib() {
     local bandwidth="$1"
     local rtt_ms="$2"
-    local bdp_kb bdp_mb recommended_mb final_mb
+    local recommended_mb final_mb
 
-    bdp_kb=$(echo "scale=2; $bandwidth * $rtt_ms / 8" | bc)
-    bdp_mb=$(echo "scale=2; $bdp_kb / 1024" | bc)
-    recommended_mb=$(echo "scale=2; $bdp_mb * 1.5" | bc)
+    recommended_mb=$(awk -v bandwidth="$bandwidth" -v rtt_ms="$rtt_ms" '
+        function trunc2(value) {
+            return int(value * 100 + 0.0000001) / 100
+        }
+        BEGIN {
+            bdp_kb = trunc2(bandwidth * rtt_ms / 8)
+            bdp_mb = trunc2(bdp_kb / 1024)
+            recommended_mb = trunc2(bdp_mb * 1.5)
+            printf "%.2f", recommended_mb
+        }
+    ')
     final_mb=$(printf "%.0f" "$recommended_mb")
 
     if [ "$final_mb" -lt 1 ]; then
@@ -281,7 +291,7 @@ else
 fi
 
 echo -e "${BLUE}=======================================================${NC}"
-echo -e "${BLUE} NetTune.sh v4.4.0 | Linux 生产网络调优${NC}"
+echo -e "${BLUE} NetTune.sh v4.4.1 | Linux 生产网络调优${NC}"
 echo -e "${BLUE}=======================================================${NC}"
 echo -e "CPU：${GREEN}${CPU_CORES} 核${NC}"
 echo -e "可用内存判定：${GREEN}${TOTAL_MEM_MB} MiB${NC}"
@@ -623,7 +633,7 @@ log_info "写入 $SYSCTL_CONF ..."
 cat >> "$SYSCTL_CONF" <<EOF
 $MARKER_START
 # =====================================================
-# NetTune.sh v4.4.0
+# NetTune.sh v4.4.1
 # 场景：$SCENARIO_DESC
 # 硬件：$TIER_DESC
 # 带宽：$BANDWIDTH_DISPLAY
@@ -692,7 +702,7 @@ fi
 
 echo ""
 echo -e "${BLUE}=======================================================${NC}"
-echo -e "${GREEN}NetTune.sh v4.4.0 部署完成${NC}"
+echo -e "${GREEN}NetTune.sh v4.4.1 部署完成${NC}"
 echo -e "${BLUE}=======================================================${NC}"
 echo "场景：$SCENARIO_DESC"
 echo "硬件：$TIER_DESC"
