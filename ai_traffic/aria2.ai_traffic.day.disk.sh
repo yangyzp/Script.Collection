@@ -9,7 +9,7 @@ LOWEST_SPEED="200K"        # 低速阈值：低于此速度算异常
 SPEED_TIMEOUT=30           # 低速持续秒数：超过则断开切换
 SLEEP_MIN_FLOAT=1.0        # 微休眠下限（下载完一个后）
 SLEEP_MAX_FLOAT=1.5        # 微休眠上限
-DOWNLOAD_DIR="/var/tmp/ai_traffic"   # 下载目录（下载完自动删除，需足够磁盘空间）
+DOWNLOAD_DIR="/var/tmp/ai_traffic"   # 下载目录（下载完自动删除， 需足够磁盘空间）
 CC_CRAWLS=(                # Common Crawl 爬取ID（6个，约30万条WARC）
     "CC-MAIN-2024-26"
     "CC-MAIN-2024-22"
