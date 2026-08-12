@@ -1,0 +1,9 @@
+运行
+chmod +x ai_traffic.sh && ./ai_traffic.sh
+
+终止
+pkill -f "ai_traffic.sh"
+
+pkill -9 -f "curl.*-o /dev/null"
+
+ps aux | grep -E "ai_traffic|curl.*/dev/null" | grep -v gre
