@@ -66,7 +66,9 @@ echo "  请确认："
 echo "  白天：每天 $DAY_HOUR:00 启动 $DAY_SCRIPT"
 echo "  黑夜：每天 $NIGHT_HOUR:00 启动 $NIGHT_SCRIPT"
 echo "============================================"
-read -rp "确认创建定时任务？(y/N): " CONFIRM
+read -rp "确认创建定时任务？(Y/n):[Y] " CONFIRM
+# 回车为空时默认y
+CONFIRM="${CONFIRM:-y}"
 if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
     echo "已取消"
     exit 0
