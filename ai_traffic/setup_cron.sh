@@ -46,8 +46,8 @@ echo "白天脚本：$DAY_SCRIPT"
 echo "黑夜脚本：$NIGHT_SCRIPT"
 echo ""
 
-prompt "白天任务 - 每天几点开始（0-23，整数小时）" "8" DAY_HOUR
-prompt "黑夜任务 - 每天几点开始（0-23，整数小时）" "23" NIGHT_HOUR
+prompt "白天任务 - 每天几点开始（0-23，整数小时）" "9" DAY_HOUR
+prompt "黑夜任务 - 每天几点开始（0-23，整数小时）" "4" NIGHT_HOUR
 
 # 校验
 if ! [[ "$DAY_HOUR" =~ ^[0-9]+$ ]] || [ "$DAY_HOUR" -lt 0 ] || [ "$DAY_HOUR" -gt 23 ]; then
