@@ -1,4 +1,8 @@
 cat > /usr/local/bin/ai_traffic.day.sh << 'DAYEOF'
+pkill -f "ai_traffic.day.sh"
+pkill -f "ai_traffic.night.sh"
+pkill -9 -f "curl.*-o /dev/null"
+
 #!/bin/bash
 set -eo pipefail
 # ==================== 配置区 ====================
