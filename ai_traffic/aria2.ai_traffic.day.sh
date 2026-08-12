@@ -11,7 +11,6 @@ CC_CRAWLS=(                # Common Crawl 爬取ID（6个，约30万条WARC）
     "CC-MAIN-2024-26"
     "CC-MAIN-2024-22"
     "CC-MAIN-2024-18"
-    "CC-MAIN-2024-14"
     "CC-MAIN-2024-10"
     "CC-MAIN-2023-50"
 )
