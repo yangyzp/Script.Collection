@@ -184,7 +184,7 @@ worker_loop() {
             -A "$rand_ua" \
             --limit-rate "$PER_WORKER_SPEED" \
             --speed-limit 1024 \
-            --speed-time 60 \
+            --speed-time 30 \
             --retry 0 \
             "$rand_url" -o /dev/null
         local exit_code="$?"
