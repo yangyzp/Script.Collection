@@ -1,9 +1,9 @@
 #!/bin/bash
 set -eo pipefail
 # ==================== 配置区 ====================
-TOTAL_SPEED="10M"          # 总带宽（aria2原生总限速）
+TOTAL_SPEED="15M"          # 总带宽（aria2原生总限速）
 CONCURRENCY=5              # 并发数
-DURATION=36000             # 运行时长（秒）9-19
+DURATION=18000             # 运行时长（秒）4-9
 CONNECT_TIMEOUT=5          # 连接超时
 LOWEST_SPEED="200K"        # 低速阈值：低于此速度算异常
 SPEED_TIMEOUT=30           # 低速持续秒数：超过则断开切换
