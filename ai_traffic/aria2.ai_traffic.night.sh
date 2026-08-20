@@ -52,7 +52,7 @@ SHM_TOTAL=$(df -k /dev/shm | awk 'NR==2 {print $2}')
 SHM_AVAIL=$(df -k /dev/shm | awk 'NR==2 {print $4}')
 SHM_TOTAL_GB=$(( SHM_TOTAL / 1024 / 1024 ))
 SHM_AVAIL_GB=$(( SHM_AVAIL / 1024 / 1024 ))
-NEED_GB=$(( CONCURRENCY * 16 ))
+NEED_GB=$(( CONCURRENCY * 6 ))
 
 echo ""
 echo "============================================"
