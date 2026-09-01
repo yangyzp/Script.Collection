@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==================================================================
-# NetTune.sh v4.4.1 - Linux 生产服务器网络调优脚本
+# NetTune.sh v4.4.3 - Linux 生产服务器网络调优脚本
 #
 # 场景：
 #   1. 高并发 Web/API/反向代理
@@ -10,7 +10,7 @@
 #   5. gost 中转/落地代理（用户 -> 中转 -> 落地）
 #   6. 多用户直连代理（用户 -> 服务器）
 #
-# v4.4.1 主要调整：
+# v4.4.3 主要调整：
 #   - 保留 /etc/sysctl.conf 单文件集中管理方式
 #   - 移除通用 tcp_mem 三档、busy_poll、tcp_notsent_lowat
 #   - 不再修改 tcp_syn_retries/tcp_synack_retries
@@ -21,9 +21,11 @@
 #   - tcp_rmem default 固定为 131072，提升新连接的初始接收缓冲区
 #   - tcp_wmem 保留系统当前 min/default
 #   - 已有更高的 TCP max 不降低，只在计算值更高时提升
-#   - 文件句柄、somaxconn、socket max 只升不降
+#   - 文件句柄、somaxconn、tcp_max_syn_backlog、socket max 只升不降
 #   - 模式 5、6 可选提高 tcp_mem 全局水位，默认保持内核自动
 #   - 使用 awk 复刻 Simple 版 BDP 取整，无需 bc 依赖
+#   - 仅模式 5、6 修改 limits.conf/system.conf；其他模式保持原样
+#   - 模式 5、6 的 nofile 档位调整为 65535/131072/262144
 # ==================================================================
 
 set -Eeuo pipefail
@@ -198,6 +200,7 @@ clean_sysctl_params() {
     local params=(
         "fs.file-max"
         "net.core.somaxconn"
+        "net.ipv4.tcp_max_syn_backlog"
         "net.core.netdev_max_backlog"
         "net.core.netdev_budget"
         "net.core.netdev_budget_usecs"
@@ -291,7 +294,7 @@ else
 fi
 
 echo -e "${BLUE}=======================================================${NC}"
-echo -e "${BLUE} NetTune.sh v4.4.1 | Linux 生产网络调优${NC}"
+echo -e "${BLUE} NetTune.sh v4.4.3 | Linux 生产网络调优${NC}"
 echo -e "${BLUE}=======================================================${NC}"
 echo -e "CPU：${GREEN}${CPU_CORES} 核${NC}"
 echo -e "可用内存判定：${GREEN}${TOTAL_MEM_MB} MiB${NC}"
@@ -398,6 +401,27 @@ case "$SCENARIO" in
 esac
 
 [ "$EXPECTED_SOMAXCONN" -gt 65535 ] && EXPECTED_SOMAXCONN=65535
+
+SERVICE_NOFILE_LIMIT=""
+if [ "$SCENARIO" = "5" ] || [ "$SCENARIO" = "6" ]; then
+    case "$HARDWARE_TIER" in
+        low)  SERVICE_NOFILE_LIMIT=65535 ;;
+        mid)  SERVICE_NOFILE_LIMIT=131072 ;;
+        high) SERVICE_NOFILE_LIMIT=262144 ;;
+    esac
+fi
+
+TCP_MAX_SYN_BACKLOG_CONFIG=""
+TCP_MAX_SYN_BACKLOG_EXPECTED=""
+if [ "$SCENARIO" = "1" ] || [ "$SCENARIO" = "5" ] || [ "$SCENARIO" = "6" ]; then
+    if sysctl_exists net.ipv4.tcp_max_syn_backlog; then
+        CURRENT_TCP_MAX_SYN_BACKLOG=$(get_sysctl_uint net.ipv4.tcp_max_syn_backlog 4096)
+        # 按硬件档位吸收突发新连接；已有更高值不降低。
+        TARGET_TCP_MAX_SYN_BACKLOG="$BASE_SOMAXCONN"
+        TCP_MAX_SYN_BACKLOG_EXPECTED=$(max_int "$CURRENT_TCP_MAX_SYN_BACKLOG" "$TARGET_TCP_MAX_SYN_BACKLOG")
+        TCP_MAX_SYN_BACKLOG_CONFIG="net.ipv4.tcp_max_syn_backlog = $TCP_MAX_SYN_BACKLOG_EXPECTED"
+    fi
+fi
 
 ENABLE_KERNEL_FORWARDING=0
 TCP_MEM_CONFIG=""
@@ -579,7 +603,9 @@ echo ""
 log_info "清理历史 NetTune 配置和同名参数..."
 sed -i "/$MARKER_START/,/$MARKER_END/d" "$SYSCTL_CONF"
 clean_sysctl_params "$SYSCTL_CONF"
-sed -i "/$MARKER_START/,/$MARKER_END/d" "$LIMITS_CONF"
+if [ "$SCENARIO" = "5" ] || [ "$SCENARIO" = "6" ]; then
+    sed -i "/$MARKER_START/,/$MARKER_END/d" "$LIMITS_CONF"
+fi
 
 shopt -s nullglob
 for config_file in /etc/sysctl.d/*.conf; do
@@ -589,7 +615,7 @@ for config_file in /etc/sysctl.d/*.conf; do
     fi
 done
 
-CONFLICT_PARAMS='fs[.]file-max|net[.]core[.]somaxconn|net[.]ipv4[.]tcp_congestion_control|net[.]core[.]default_qdisc|net[.]ipv4[.]tcp_rmem|net[.]ipv4[.]tcp_wmem'
+CONFLICT_PARAMS='fs[.]file-max|net[.]core[.]somaxconn|net[.]ipv4[.]tcp_max_syn_backlog|net[.]ipv4[.]tcp_congestion_control|net[.]core[.]default_qdisc|net[.]ipv4[.]tcp_rmem|net[.]ipv4[.]tcp_wmem'
 for config_file in /etc/sysctl.d/*.conf; do
     if grep -qE "^[[:space:]]*(${CONFLICT_PARAMS})[[:space:]]*=" "$config_file" 2>/dev/null; then
         log_warn "$config_file 中存在可能覆盖本脚本的参数，请手动确认加载顺序"
@@ -602,25 +628,27 @@ if [ -f /etc/sysctl.d/99-high-concurrency.conf ]; then
     echo "  已删除 /etc/sysctl.d/99-high-concurrency.conf"
 fi
 
-echo ""
-log_info "设置文件句柄限制..."
-cat >> "$LIMITS_CONF" <<EOF
+if [ "$SCENARIO" = "5" ] || [ "$SCENARIO" = "6" ]; then
+    echo ""
+    log_info "设置文件句柄限制（模式 $SCENARIO）..."
+    cat >> "$LIMITS_CONF" <<EOF
 $MARKER_START
-* soft nofile $SYSTEM_MAX_FILE
-* hard nofile $SYSTEM_MAX_FILE
-root soft nofile $SYSTEM_MAX_FILE
-root hard nofile $SYSTEM_MAX_FILE
+* soft nofile $SERVICE_NOFILE_LIMIT
+* hard nofile $SERVICE_NOFILE_LIMIT
+root soft nofile $SERVICE_NOFILE_LIMIT
+root hard nofile $SERVICE_NOFILE_LIMIT
 $MARKER_END
 EOF
 
-if command -v systemctl >/dev/null 2>&1; then
-    # 清理由旧版 NetTune 写入的全局 NPROC 值；进程数应由具体服务管理。
-    sed -i -E '/^[#[:space:]]*DefaultLimitNPROC=65535[[:space:]]*$/d' "$SYSTEMD_CONF"
-    sed -i -E "s/^[#[:space:]]*DefaultLimitNOFILE=.*/DefaultLimitNOFILE=$SYSTEM_MAX_FILE/" "$SYSTEMD_CONF"
-    if ! grep -qE '^[[:space:]]*DefaultLimitNOFILE=' "$SYSTEMD_CONF"; then
-        echo "DefaultLimitNOFILE=$SYSTEM_MAX_FILE" >> "$SYSTEMD_CONF"
+    if command -v systemctl >/dev/null 2>&1; then
+        # 清理由旧版 NetTune 写入的全局 NPROC 值；进程数应由具体服务管理。
+        sed -i -E '/^[#[:space:]]*DefaultLimitNPROC=65535[[:space:]]*$/d' "$SYSTEMD_CONF"
+        sed -i -E "s/^[#[:space:]]*DefaultLimitNOFILE=.*/DefaultLimitNOFILE=$SERVICE_NOFILE_LIMIT/" "$SYSTEMD_CONF"
+        if ! grep -qE '^[[:space:]]*DefaultLimitNOFILE=' "$SYSTEMD_CONF"; then
+            echo "DefaultLimitNOFILE=$SERVICE_NOFILE_LIMIT" >> "$SYSTEMD_CONF"
+        fi
+        systemctl daemon-reexec 2>/dev/null || log_warn "systemd daemon-reexec 执行失败"
     fi
-    systemctl daemon-reexec 2>/dev/null || log_warn "systemd daemon-reexec 执行失败"
 fi
 
 TCP_TW_REUSE_CONFIG=""
@@ -633,7 +661,7 @@ log_info "写入 $SYSCTL_CONF ..."
 cat >> "$SYSCTL_CONF" <<EOF
 $MARKER_START
 # =====================================================
-# NetTune.sh v4.4.1
+# NetTune.sh v4.4.3
 # 场景：$SCENARIO_DESC
 # 硬件：$TIER_DESC
 # 带宽：$BANDWIDTH_DISPLAY
@@ -653,6 +681,7 @@ net.core.netdev_budget_usecs = $NETDEV_BUDGET_USECS
 # TCP 基础配置
 net.ipv4.tcp_syncookies = 1
 $TCP_TW_REUSE_CONFIG
+${TCP_MAX_SYN_BACKLOG_CONFIG}
 net.ipv4.tcp_fin_timeout = $TCP_FIN_TIMEOUT
 net.ipv4.tcp_keepalive_time = $TCP_KEEPALIVE_TIME
 net.ipv4.tcp_keepalive_intvl = $TCP_KEEPALIVE_INTVL
@@ -702,7 +731,7 @@ fi
 
 echo ""
 echo -e "${BLUE}=======================================================${NC}"
-echo -e "${GREEN}NetTune.sh v4.4.1 部署完成${NC}"
+echo -e "${GREEN}NetTune.sh v4.4.3 部署完成${NC}"
 echo -e "${BLUE}=======================================================${NC}"
 echo "场景：$SCENARIO_DESC"
 echo "硬件：$TIER_DESC"
@@ -714,7 +743,8 @@ echo "最终 tcp_wmem：$TCP_WMEM_EXPECTED"
 echo "TCP 内存余量：$TCP_MEM_DESC"
 [ -n "$TCP_MEM_EXPECTED" ] && echo "最终 tcp_mem：$TCP_MEM_EXPECTED"
 echo "somaxconn：$EXPECTED_SOMAXCONN"
-echo "nofile：$SYSTEM_MAX_FILE"
+[ -n "$TCP_MAX_SYN_BACKLOG_EXPECTED" ] && echo "tcp_max_syn_backlog：$TCP_MAX_SYN_BACKLOG_EXPECTED"
+[ -n "$SERVICE_NOFILE_LIMIT" ] && echo "代理服务 nofile：$SERVICE_NOFILE_LIMIT"
 
 if [ "$BBR_ENABLED" -eq 1 ]; then
     echo "拥塞控制：BBR + fq（新建连接生效）"
@@ -737,6 +767,7 @@ echo "  sysctl net.ipv4.tcp_congestion_control"
 echo "  sysctl net.core.default_qdisc"
 echo "  tc qdisc show 2>/dev/null"
 echo "  sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem"
+echo "  sysctl net.ipv4.tcp_max_syn_backlog"
 if [ -n "$TCP_MEM_EXPECTED" ]; then
     echo "  sysctl net.ipv4.tcp_mem"
     echo "  nstat -az 2>/dev/null | grep -E 'TCPMemoryPressures|TCPMemoryPressuresChrono'"
@@ -750,17 +781,25 @@ fi
 
 echo ""
 echo -e "${YELLOW}生效说明：${NC}"
-echo "1. 重新登录 SSH 后，PAM 文件句柄限制才会更新"
-echo "2. 重启 gost/Nginx/数据库等服务，使新连接使用新参数"
-echo "3. 建议维护窗口重启服务器，以恢复已移除旧参数的内核运行时默认值"
-echo "4. fq 是默认 qdisc 设置；请以 tc qdisc show 的实际输出为准"
+if [ -n "$SERVICE_NOFILE_LIMIT" ]; then
+    echo "1. 重新登录 SSH 后，PAM 文件句柄限制才会更新"
+    echo "2. 重启 gost 等代理服务，使新的 nofile 限制生效"
+    echo "3. 建议维护窗口重启服务器，以恢复已移除旧参数的内核运行时默认值"
+    echo "4. fq 是默认 qdisc 设置；请以 tc qdisc show 的实际输出为准"
+else
+    echo "1. 重启 gost/Nginx/数据库等服务，使新连接使用新参数"
+    echo "2. 建议维护窗口重启服务器，以恢复已移除旧参数的内核运行时默认值"
+    echo "3. fq 是默认 qdisc 设置；请以 tc qdisc show 的实际输出为准"
+fi
 
 echo ""
 echo -e "${YELLOW}回滚命令：${NC}"
 echo "  cp $BACKUP_DIR/sysctl.conf /etc/sysctl.conf"
-echo "  cp $BACKUP_DIR/limits.conf /etc/security/limits.conf"
-echo "  cp $BACKUP_DIR/system.conf /etc/systemd/system.conf"
 echo "  sysctl -p /etc/sysctl.conf"
-echo "  systemctl daemon-reexec"
+if [ -n "$SERVICE_NOFILE_LIMIT" ]; then
+    echo "  cp $BACKUP_DIR/limits.conf /etc/security/limits.conf"
+    echo "  cp $BACKUP_DIR/system.conf /etc/systemd/system.conf"
+    echo "  systemctl daemon-reexec"
+fi
 echo ""
 echo "备份目录：$BACKUP_DIR"
