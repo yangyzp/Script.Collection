@@ -1,0 +1,15 @@
+[Unit]
+Description=Local Clash generate_204 responder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/fake204
+ExecStart=/opt/fake204/fake204
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
