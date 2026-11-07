@@ -1,3 +1,8 @@
+```
+if ! command -v curl &> /dev/null; then apt update && apt install curl -y; fi; rm -f tc-shaper.sh; curl -L -o ./tc-shaper.sh "https://v4.gh-proxy.org/https://raw.githubusercontent.com/yangyzp/Script.Collection/master/tc-shaper/tc-shaper.sh"; chmod +x ./tc-shaper.sh && ./tc-shaper.sh
+```
+
+
 ==================== TC 出站限速管理工具 ====================
   1. 对指定 IP 设置独立出站限速
   2. 设置全局所有 IP 出站限速
