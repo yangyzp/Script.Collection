@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==================================================================
-# NetTune.sh v4.4.3 - Linux 生产服务器网络调优脚本
+# NetTune.sh v4.5.0 - Linux 生产服务器网络调优脚本
 #
 # 场景：
 #   1. 高并发 Web/API/反向代理
@@ -9,6 +9,11 @@
 #   4. 批处理/大数据任务
 #   5. gost 中转/落地代理（用户 -> 中转 -> 落地）
 #   6. 多用户直连代理（用户 -> 服务器）
+#
+# v4.5.0 主要调整：
+#   - 配置写入改为“临时副本 + 试应用 + 原子替换”，失败时不再清空 /etc/sysctl.conf
+#   - 所有 SCENARIO 判断改用 ${SCENARIO:-}，配合 set -u 不再因未定义变量中途退出
+#   - 历史 NetTune 块与 99-high-concurrency.conf 只在本次成功后才清理
 #
 # v4.4.3 主要调整：
 #   - 保留 /etc/sysctl.conf 单文件集中管理方式
@@ -61,13 +66,13 @@ die() {
     exit 1
 }
 
-trap 'echo -e "\n\033[0;31m脚本被中断，配置可能不完整，请使用备份目录回滚\033[0m"; exit 1' INT TERM
+trap 'echo -e "\n\033[0;31m脚本被中断，本次配置尚未写入，正在清理临时文件\033[0m"; exit 1' INT TERM
 
 if [ "$(id -u)" -ne 0 ]; then
     die "必须以 root 权限运行"
 fi
 
-for command_name in awk cat cp cut free getconf grep mkdir nproc rm sed sysctl touch uname; do
+for command_name in awk cat cp cut free getconf grep mkdir mktemp mv nproc rm sed sysctl touch uname; do
     command -v "$command_name" >/dev/null 2>&1 || die "缺少必要命令：$command_name"
 done
 
@@ -294,7 +299,7 @@ else
 fi
 
 echo -e "${BLUE}=======================================================${NC}"
-echo -e "${BLUE} NetTune.sh v4.4.3 | Linux 生产网络调优${NC}"
+echo -e "${BLUE} NetTune.sh v4.5.0 | Linux 生产网络调优${NC}"
 echo -e "${BLUE}=======================================================${NC}"
 echo -e "CPU：${GREEN}${CPU_CORES} 核${NC}"
 echo -e "可用内存判定：${GREEN}${TOTAL_MEM_MB} MiB${NC}"
@@ -311,7 +316,7 @@ echo "6. 多用户直连代理（用户 -> 服务器）"
 read -r -p "请输入选项 [默认 2]: " SCENARIO
 SCENARIO=${SCENARIO:-2}
 
-case "$SCENARIO" in
+case "${SCENARIO:-}" in
     1)
         SCENARIO_DESC="高并发 Web/API/反向代理"
         TCP_RETRIES2=8
@@ -403,7 +408,7 @@ esac
 [ "$EXPECTED_SOMAXCONN" -gt 65535 ] && EXPECTED_SOMAXCONN=65535
 
 SERVICE_NOFILE_LIMIT=""
-if [ "$SCENARIO" = "5" ] || [ "$SCENARIO" = "6" ]; then
+if [ "${SCENARIO:-}" = "5" ] || [ "${SCENARIO:-}" = "6" ]; then
     case "$HARDWARE_TIER" in
         low)  SERVICE_NOFILE_LIMIT=65535 ;;
         mid)  SERVICE_NOFILE_LIMIT=131072 ;;
@@ -413,7 +418,7 @@ fi
 
 TCP_MAX_SYN_BACKLOG_CONFIG=""
 TCP_MAX_SYN_BACKLOG_EXPECTED=""
-if [ "$SCENARIO" = "1" ] || [ "$SCENARIO" = "5" ] || [ "$SCENARIO" = "6" ]; then
+if [ "${SCENARIO:-}" = "1" ] || [ "${SCENARIO:-}" = "5" ] || [ "${SCENARIO:-}" = "6" ]; then
     if sysctl_exists net.ipv4.tcp_max_syn_backlog; then
         CURRENT_TCP_MAX_SYN_BACKLOG=$(get_sysctl_uint net.ipv4.tcp_max_syn_backlog 4096)
         # 按硬件档位吸收突发新连接；已有更高值不降低。
@@ -428,7 +433,7 @@ TCP_MEM_CONFIG=""
 TCP_MEM_DESC="内核自动（不写 tcp_mem）"
 TCP_MEM_EXPECTED=""
 
-if [ "$SCENARIO" = "5" ] || [ "$SCENARIO" = "6" ]; then
+if [ "${SCENARIO:-}" = "5" ] || [ "${SCENARIO:-}" = "6" ]; then
     echo ""
     echo -e "${YELLOW}⚡ TCP 内存余量（仅影响高并发时的全局 TCP 缓冲空间）${NC}"
     echo "1. 内核自动（默认；大多数 200Mbps/少量连接场景足够）"
@@ -492,7 +497,7 @@ if [ "$SCENARIO" = "5" ] || [ "$SCENARIO" = "6" ]; then
 fi
 
 echo ""
-if [ "$SCENARIO" = "5" ]; then
+if [ "${SCENARIO:-}" = "5" ]; then
     echo -e "${YELLOW}模式 5 使用整条中转链路的瓶颈带宽和较大 P95 RTT。${NC}"
     read_number "两段链路的瓶颈单连接带宽 Mbps" "100" "10000" BANDWIDTH
     read_number "两段链路中较大的 P95 RTT ms" "100" "1000" RTT_MS
@@ -509,7 +514,7 @@ if [ "$SCENARIO" = "5" ]; then
     esac
 else
     read_number "服务器最大单连接期望带宽 Mbps" "100" "10000" BANDWIDTH
-    if [ "$SCENARIO" = "6" ]; then
+    if [ "${SCENARIO:-}" = "6" ]; then
         read_number "用户到服务器的 P95 RTT ms" "200" "1000" RTT_MS
     else
         read_number "主要链路的 P95 RTT ms" "100" "1000" RTT_MS
@@ -574,7 +579,7 @@ fi
 
 FORWARDING_CONFIG=""
 CONNTRACK_MAX_DISPLAY=""
-if [ "$SCENARIO" = "5" ] && [ "$ENABLE_KERNEL_FORWARDING" -eq 1 ]; then
+if [ "${SCENARIO:-}" = "5" ] && [ "$ENABLE_KERNEL_FORWARDING" -eq 1 ]; then
     FORWARDING_CONFIG="net.ipv4.ip_forward = 1"
     command -v modprobe >/dev/null 2>&1 && modprobe nf_conntrack 2>/dev/null || true
     if sysctl_exists net.netfilter.nf_conntrack_max; then
@@ -599,23 +604,35 @@ cp "$LIMITS_CONF" "$BACKUP_DIR/limits.conf" || die "limits.conf 备份失败"
 cp "$SYSTEMD_CONF" "$BACKUP_DIR/system.conf" || die "system.conf 备份失败"
 log_ok "备份完成：$BACKUP_DIR"
 
+# v4.5.0：所有改动先落到临时副本，全部成功后再原子替换正式文件。
+# 旧版直接编辑 /etc/sysctl.conf：一旦脚本中途退出（例如 set -u 遇到未定义变量），
+# 旧参数已经被删掉、新参数还没写入，配置文件就成了空壳，重启后内核参数全部回落默认值。
+WORK_DIR=$(mktemp -d /tmp/nettune.XXXXXX) || die "无法创建临时目录"
+cleanup_work_dir() {
+    if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
+        rm -rf "$WORK_DIR"
+    fi
+}
+trap cleanup_work_dir EXIT
+WORK_SYSCTL_CONF="$WORK_DIR/sysctl.conf"
+WORK_LIMITS_CONF="$WORK_DIR/limits.conf"
+WORK_SYSTEMD_CONF="$WORK_DIR/system.conf"
+cp "$SYSCTL_CONF" "$WORK_SYSCTL_CONF" || die "创建 sysctl.conf 工作副本失败"
+cp "$LIMITS_CONF" "$WORK_LIMITS_CONF" || die "创建 limits.conf 工作副本失败"
+cp "$SYSTEMD_CONF" "$WORK_SYSTEMD_CONF" || die "创建 system.conf 工作副本失败"
+LIMITS_UPDATED=0
+SYSTEMD_UPDATED=0
+
 echo ""
 log_info "清理历史 NetTune 配置和同名参数..."
-sed -i "/$MARKER_START/,/$MARKER_END/d" "$SYSCTL_CONF"
-clean_sysctl_params "$SYSCTL_CONF"
-if [ "$SCENARIO" = "5" ] || [ "$SCENARIO" = "6" ]; then
-    sed -i "/$MARKER_START/,/$MARKER_END/d" "$LIMITS_CONF"
+sed -i "/$MARKER_START/,/$MARKER_END/d" "$WORK_SYSCTL_CONF"
+clean_sysctl_params "$WORK_SYSCTL_CONF"
+if [ "${SCENARIO:-}" = "5" ] || [ "${SCENARIO:-}" = "6" ]; then
+    sed -i "/$MARKER_START/,/$MARKER_END/d" "$WORK_LIMITS_CONF"
 fi
 
-shopt -s nullglob
-for config_file in /etc/sysctl.d/*.conf; do
-    if grep -qF "$MARKER_START" "$config_file" 2>/dev/null; then
-        sed -i "/$MARKER_START/,/$MARKER_END/d" "$config_file"
-        echo "  已清理 $config_file 中的历史 NetTune 块"
-    fi
-done
-
 CONFLICT_PARAMS='fs[.]file-max|net[.]core[.]somaxconn|net[.]ipv4[.]tcp_max_syn_backlog|net[.]ipv4[.]tcp_congestion_control|net[.]core[.]default_qdisc|net[.]ipv4[.]tcp_rmem|net[.]ipv4[.]tcp_wmem'
+shopt -s nullglob
 for config_file in /etc/sysctl.d/*.conf; do
     if grep -qE "^[[:space:]]*(${CONFLICT_PARAMS})[[:space:]]*=" "$config_file" 2>/dev/null; then
         log_warn "$config_file 中存在可能覆盖本脚本的参数，请手动确认加载顺序"
@@ -623,15 +640,10 @@ for config_file in /etc/sysctl.d/*.conf; do
 done
 shopt -u nullglob
 
-if [ -f /etc/sysctl.d/99-high-concurrency.conf ]; then
-    rm -f /etc/sysctl.d/99-high-concurrency.conf
-    echo "  已删除 /etc/sysctl.d/99-high-concurrency.conf"
-fi
-
-if [ "$SCENARIO" = "5" ] || [ "$SCENARIO" = "6" ]; then
+if [ "${SCENARIO:-}" = "5" ] || [ "${SCENARIO:-}" = "6" ]; then
     echo ""
-    log_info "设置文件句柄限制（模式 $SCENARIO）..."
-    cat >> "$LIMITS_CONF" <<EOF
+    log_info "设置文件句柄限制（模式 ${SCENARIO:-}）..."
+    cat >> "$WORK_LIMITS_CONF" <<EOF
 $MARKER_START
 * soft nofile $SERVICE_NOFILE_LIMIT
 * hard nofile $SERVICE_NOFILE_LIMIT
@@ -639,15 +651,16 @@ root soft nofile $SERVICE_NOFILE_LIMIT
 root hard nofile $SERVICE_NOFILE_LIMIT
 $MARKER_END
 EOF
+    LIMITS_UPDATED=1
 
     if command -v systemctl >/dev/null 2>&1; then
         # 清理由旧版 NetTune 写入的全局 NPROC 值；进程数应由具体服务管理。
-        sed -i -E '/^[#[:space:]]*DefaultLimitNPROC=65535[[:space:]]*$/d' "$SYSTEMD_CONF"
-        sed -i -E "s/^[#[:space:]]*DefaultLimitNOFILE=.*/DefaultLimitNOFILE=$SERVICE_NOFILE_LIMIT/" "$SYSTEMD_CONF"
-        if ! grep -qE '^[[:space:]]*DefaultLimitNOFILE=' "$SYSTEMD_CONF"; then
-            echo "DefaultLimitNOFILE=$SERVICE_NOFILE_LIMIT" >> "$SYSTEMD_CONF"
+        sed -i -E '/^[#[:space:]]*DefaultLimitNPROC=65535[[:space:]]*$/d' "$WORK_SYSTEMD_CONF"
+        sed -i -E "s/^[#[:space:]]*DefaultLimitNOFILE=.*/DefaultLimitNOFILE=$SERVICE_NOFILE_LIMIT/" "$WORK_SYSTEMD_CONF"
+        if ! grep -qE '^[[:space:]]*DefaultLimitNOFILE=' "$WORK_SYSTEMD_CONF"; then
+            echo "DefaultLimitNOFILE=$SERVICE_NOFILE_LIMIT" >> "$WORK_SYSTEMD_CONF"
         fi
-        systemctl daemon-reexec 2>/dev/null || log_warn "systemd daemon-reexec 执行失败"
+        SYSTEMD_UPDATED=1
     fi
 fi
 
@@ -657,11 +670,11 @@ if [ "$TCP_TW_REUSE" -eq 1 ]; then
 fi
 
 echo ""
-log_info "写入 $SYSCTL_CONF ..."
-cat >> "$SYSCTL_CONF" <<EOF
+log_info "生成新的 $SYSCTL_CONF 内容（写入临时副本）..."
+cat >> "$WORK_SYSCTL_CONF" <<EOF
 $MARKER_START
 # =====================================================
-# NetTune.sh v4.4.3
+# NetTune.sh v4.5.0
 # 场景：$SCENARIO_DESC
 # 硬件：$TIER_DESC
 # 带宽：$BANDWIDTH_DISPLAY
@@ -716,22 +729,54 @@ $MARKER_END
 EOF
 
 echo ""
-log_info "应用内核配置..."
+log_info "应用内核配置（先对临时文件 sysctl -p 试应用，失败则不覆盖正式配置）..."
 set +e
-SYSCTL_OUTPUT=$(sysctl -p "$SYSCTL_CONF" 2>&1)
+SYSCTL_OUTPUT=$(sysctl -p "$WORK_SYSCTL_CONF" 2>&1)
 SYSCTL_STATUS=$?
 set -e
 
 if [ "$SYSCTL_STATUS" -ne 0 ]; then
-    log_warn "部分参数应用失败："
+    log_warn "新配置应用失败，/etc/sysctl.conf 保持执行前的内容（未被清空）："
     echo "$SYSCTL_OUTPUT"
-else
-    log_ok "sysctl 参数已应用"
+    echo ""
+    log_warn "原配置备份：$BACKUP_DIR/sysctl.conf"
+    die "已中止，请修复上面报错的参数后重试"
+fi
+log_ok "sysctl 参数已应用"
+
+# 只有试应用成功才替换正式文件，避免留下半套配置
+for target_file in "$WORK_SYSCTL_CONF" "$WORK_LIMITS_CONF" "$WORK_SYSTEMD_CONF"; do
+    chmod 644 "$target_file" 2>/dev/null || true
+    chown root:root "$target_file" 2>/dev/null || true
+done
+mv -f "$WORK_SYSCTL_CONF" "$SYSCTL_CONF" || die "写入 $SYSCTL_CONF 失败"
+if [ "$LIMITS_UPDATED" -eq 1 ]; then
+    mv -f "$WORK_LIMITS_CONF" "$LIMITS_CONF" || die "写入 $LIMITS_CONF 失败"
+fi
+if [ "$SYSTEMD_UPDATED" -eq 1 ]; then
+    mv -f "$WORK_SYSTEMD_CONF" "$SYSTEMD_CONF" || die "写入 $SYSTEMD_CONF 失败"
+    systemctl daemon-reexec 2>/dev/null || log_warn "systemd daemon-reexec 执行失败"
+fi
+log_ok "配置已写入 $SYSCTL_CONF"
+
+# 以下清理只在本次配置成功落盘后执行，失败时原样保留
+shopt -s nullglob
+for config_file in /etc/sysctl.d/*.conf; do
+    if grep -qF "$MARKER_START" "$config_file" 2>/dev/null; then
+        sed -i "/$MARKER_START/,/$MARKER_END/d" "$config_file"
+        echo "  已清理 $config_file 中的历史 NetTune 块"
+    fi
+done
+shopt -u nullglob
+
+if [ -f /etc/sysctl.d/99-high-concurrency.conf ]; then
+    rm -f /etc/sysctl.d/99-high-concurrency.conf
+    echo "  已删除 /etc/sysctl.d/99-high-concurrency.conf"
 fi
 
 echo ""
 echo -e "${BLUE}=======================================================${NC}"
-echo -e "${GREEN}NetTune.sh v4.4.3 部署完成${NC}"
+echo -e "${GREEN}NetTune.sh v4.5.0 部署完成${NC}"
 echo -e "${BLUE}=======================================================${NC}"
 echo "场景：$SCENARIO_DESC"
 echo "硬件：$TIER_DESC"
@@ -752,7 +797,7 @@ else
     echo "拥塞控制：保留系统当前设置"
 fi
 
-if [ "$SCENARIO" = "5" ]; then
+if [ "${SCENARIO:-}" = "5" ]; then
     if [ "$ENABLE_KERNEL_FORWARDING" -eq 1 ]; then
         echo "内核转发：已启用"
         [ -n "$CONNTRACK_MAX_DISPLAY" ] && echo "conntrack_max：$CONNTRACK_MAX_DISPLAY"
@@ -775,7 +820,7 @@ fi
 echo "  ss -s"
 echo "  nstat -az 2>/dev/null | grep -E 'TcpRetransSegs|TcpOutSegs|TCPLostRetransmit'"
 echo "  cat /proc/net/softnet_stat"
-if [ "$SCENARIO" = "5" ]; then
+if [ "${SCENARIO:-}" = "5" ]; then
     echo "  建议分别测试用户到中转、中转到落地，再填瓶颈带宽和较大 P95 RTT"
 fi
 
